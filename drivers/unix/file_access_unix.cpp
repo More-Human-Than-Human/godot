@@ -99,7 +99,7 @@ Error FileAccessUnix::open_internal(const String &p_path, int p_mode_flags) {
 		}
 	}
 
-#if defined(TOOLS_ENABLED)
+#if defined(TOOLS_ENABLED) && !defined(MACOS_ENABLED)
 	if (p_mode_flags & READ) {
 		String real_path = get_real_path();
 		if (real_path != path) {
