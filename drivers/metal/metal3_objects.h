@@ -567,6 +567,8 @@ public:
 			VectorView<RDD::BufferBarrier> p_buffer_barriers,
 			VectorView<RDD::TextureBarrier> p_texture_barriers,
 			VectorView<RDD::AccelerationStructureBarrier> p_acceleration_structure_barriers) override;
+	// DUMBAI: Allow RenderingDevice timestamp captures to sample counters through the currently active Metal encoder.
+	bool sample_timestamp(MTL::CounterSampleBuffer *p_sample_buffer, uint32_t p_sample_index) override;
 
 #pragma mark - Debugging
 

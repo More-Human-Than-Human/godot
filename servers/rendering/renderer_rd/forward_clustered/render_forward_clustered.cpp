@@ -31,6 +31,7 @@
 #include "render_forward_clustered.h"
 
 #include "core/config/project_settings.h"
+#include "core/os/os.h"
 #include "servers/rendering/renderer_rd/environment/fog.h"
 #include "servers/rendering/renderer_rd/framebuffer_cache_rd.h"
 #include "servers/rendering/renderer_rd/storage_rd/light_storage.h"
@@ -804,9 +805,10 @@ void RenderForwardClustered::SceneState::grow_instance_buffer(RenderListType p_r
 	}
 }
 
-void RenderForwardClustered::_fill_instance_data(RenderListType p_render_list, int *p_render_info, uint32_t p_offset, int32_t p_max_elements, bool p_update_buffer) {
+void RenderForwardClustered::_fill_instance_data(RenderListType p_render_list, int *p_render_info, uint32_t p_offset, int32_t p_max_elements, bool p_update_buffer, uint64_t *r_draw_call_count) {
 	RenderList *rl = &render_list[p_render_list];
 	uint32_t element_total = p_max_elements >= 0 ? uint32_t(p_max_elements) : rl->elements.size();
+	uint64_t draw_call_count = 0;
 
 	rl->element_info.resize(p_offset + element_total);
 
@@ -890,6 +892,7 @@ void RenderForwardClustered::_fill_instance_data(RenderListType p_render_list, i
 			if (p_render_info) {
 				p_render_info[RSE::VIEWPORT_RENDER_INFO_DRAW_CALLS_IN_FRAME]++;
 			}
+			draw_call_count++;
 		}
 
 		RenderElementInfo &element_info = rl->element_info[p_offset + i];
@@ -912,6 +915,10 @@ void RenderForwardClustered::_fill_instance_data(RenderListType p_render_list, i
 	if (p_update_buffer && element_total > 0u) {
 		RenderingDevice::get_singleton()->buffer_flush(scene_state.instance_buffer[p_render_list]._get(0u));
 	}
+	if (r_draw_call_count) {
+		// DUMBAI: Report draw call count from render-list compaction so benchmark pass telemetry uses the same batching rules as the actual draw submission.
+		*r_draw_call_count = draw_call_count;
+	}
 }
 
 _FORCE_INLINE_ static uint32_t _indices_to_primitives(RSE::PrimitiveType p_primitive, uint32_t p_indices) {
@@ -919,9 +926,13 @@ _FORCE_INLINE_ static uint32_t _indices_to_primitives(RSE::PrimitiveType p_primi
 	static const uint32_t subtractor[RSE::PRIMITIVE_MAX] = { 0, 0, 1, 0, 2 };
 	return (p_indices - subtractor[p_primitive]) / divisor[p_primitive];
 }
-void RenderForwardClustered::_fill_render_list(RenderListType p_render_list, const RenderDataRD *p_render_data, PassMode p_pass_mode, bool p_using_sdfgi, bool p_using_opaque_gi, bool p_using_motion_pass, bool p_append) {
+void RenderForwardClustered::_fill_render_list(RenderListType p_render_list, const RenderDataRD *p_render_data, PassMode p_pass_mode, bool p_using_sdfgi, bool p_using_opaque_gi, bool p_using_motion_pass, bool p_append, uint64_t *r_opaque_primitives, uint64_t *r_alpha_primitives, uint64_t *r_motion_primitives, uint64_t *r_shadow_primitives) {
 	RendererRD::MeshStorage *mesh_storage = RendererRD::MeshStorage::get_singleton();
 	uint64_t frame = RSG::rasterizer->get_frame_number();
+	uint64_t opaque_primitives = 0;
+	uint64_t alpha_primitives = 0;
+	uint64_t motion_primitives = 0;
+	uint64_t shadow_primitives = 0;
 
 	if (p_render_list == RENDER_LIST_OPAQUE) {
 		scene_state.used_sss = false;
@@ -1102,30 +1113,41 @@ void RenderForwardClustered::_fill_render_list(RenderListType p_render_list, con
 		while (surf) {
 			surf->sort.uses_forward_gi = 0;
 			surf->sort.uses_lightmap = 0;
+			const bool need_primitive_estimate = p_render_data->render_info || r_opaque_primitives || r_alpha_primitives || r_motion_primitives || r_shadow_primitives;
+			uint64_t surface_primitives = 0;
+			uint64_t primitive_metric = 0;
 
 			// LOD
 			if (p_render_data->scene_data->screen_mesh_lod_threshold > 0.0 && mesh_storage->mesh_surface_has_lod(surf->surface)) {
 				uint32_t indices = 0;
 				surf->sort.lod_index = mesh_storage->mesh_surface_get_lod(surf->surface, inst->lod_model_scale * inst->lod_bias, lod_distance * p_render_data->scene_data->lod_distance_multiplier, p_render_data->scene_data->screen_mesh_lod_threshold, indices);
-				if (p_render_data->render_info) {
+				if (need_primitive_estimate) {
 					indices = _indices_to_primitives(surf->primitive, indices);
+					surface_primitives = indices;
+					primitive_metric = indices;
+				}
+				if (p_render_data->render_info) {
 					if (p_render_list == RENDER_LIST_OPAQUE) { //opaque
-						p_render_data->render_info->info[RSE::VIEWPORT_RENDER_INFO_TYPE_VISIBLE][RSE::VIEWPORT_RENDER_INFO_PRIMITIVES_IN_FRAME] += indices;
+						p_render_data->render_info->info[RSE::VIEWPORT_RENDER_INFO_TYPE_VISIBLE][RSE::VIEWPORT_RENDER_INFO_PRIMITIVES_IN_FRAME] += int(primitive_metric);
 					} else if (p_render_list == RENDER_LIST_SECONDARY) { //shadow
-						p_render_data->render_info->info[RSE::VIEWPORT_RENDER_INFO_TYPE_SHADOW][RSE::VIEWPORT_RENDER_INFO_PRIMITIVES_IN_FRAME] += indices;
+						p_render_data->render_info->info[RSE::VIEWPORT_RENDER_INFO_TYPE_SHADOW][RSE::VIEWPORT_RENDER_INFO_PRIMITIVES_IN_FRAME] += int(primitive_metric);
 					}
 				}
 			} else {
 				surf->sort.lod_index = 0;
-				if (p_render_data->render_info) {
+				if (need_primitive_estimate) {
 					// This does not include primitives rendered via indirect draw calls.
 					uint32_t to_draw = mesh_storage->mesh_surface_get_vertices_drawn_count(surf->surface);
 					to_draw = _indices_to_primitives(surf->primitive, to_draw);
 					to_draw *= inst->instance_count;
+					surface_primitives = to_draw;
+					primitive_metric = to_draw;
+				}
+				if (p_render_data->render_info) {
 					if (p_render_list == RENDER_LIST_OPAQUE) { //opaque
-						p_render_data->render_info->info[RSE::VIEWPORT_RENDER_INFO_TYPE_VISIBLE][RSE::VIEWPORT_RENDER_INFO_PRIMITIVES_IN_FRAME] += to_draw;
+						p_render_data->render_info->info[RSE::VIEWPORT_RENDER_INFO_TYPE_VISIBLE][RSE::VIEWPORT_RENDER_INFO_PRIMITIVES_IN_FRAME] += int(primitive_metric);
 					} else if (p_render_list == RENDER_LIST_SECONDARY) { //shadow
-						p_render_data->render_info->info[RSE::VIEWPORT_RENDER_INFO_TYPE_SHADOW][RSE::VIEWPORT_RENDER_INFO_PRIMITIVES_IN_FRAME] += to_draw;
+						p_render_data->render_info->info[RSE::VIEWPORT_RENDER_INFO_TYPE_SHADOW][RSE::VIEWPORT_RENDER_INFO_PRIMITIVES_IN_FRAME] += int(primitive_metric);
 					}
 				}
 			}
@@ -1144,17 +1166,20 @@ void RenderForwardClustered::_fill_render_list(RenderListType p_render_list, con
 
 				if (!force_alpha && (surf->flags & (GeometryInstanceSurfaceDataCache::FLAG_PASS_DEPTH | GeometryInstanceSurfaceDataCache::FLAG_PASS_OPAQUE))) {
 					rl->add_element(surf);
+					opaque_primitives += surface_primitives;
 				}
 
 				if (force_alpha || (surf->flags & GeometryInstanceSurfaceDataCache::FLAG_PASS_ALPHA)) {
 					surf->color_pass_inclusion_mask = COLOR_PASS_FLAG_TRANSPARENT;
 					render_list[RENDER_LIST_ALPHA].add_element(surf);
+					alpha_primitives += surface_primitives;
 					if (uses_gi) {
 						surf->sort.uses_forward_gi = 1;
 					}
 				} else if (p_using_motion_pass && (uses_motion || (surf->flags & GeometryInstanceSurfaceDataCache::FLAG_USES_MOTION_VECTOR))) {
 					surf->color_pass_inclusion_mask = COLOR_PASS_FLAG_MOTION_VECTORS;
 					render_list[RENDER_LIST_MOTION].add_element(surf);
+					motion_primitives += surface_primitives;
 				} else {
 					surf->color_pass_inclusion_mask = 0;
 				}
@@ -1182,6 +1207,7 @@ void RenderForwardClustered::_fill_render_list(RenderListType p_render_list, con
 			} else if (p_pass_mode == PASS_MODE_SHADOW || p_pass_mode == PASS_MODE_SHADOW_DP) {
 				if (surf->flags & GeometryInstanceSurfaceDataCache::FLAG_PASS_SHADOW) {
 					rl->add_element(surf);
+					shadow_primitives += surface_primitives;
 				}
 			} else if (p_pass_mode == PASS_MODE_DEPTH_MATERIAL) {
 				if (surf->flags & (GeometryInstanceSurfaceDataCache::FLAG_PASS_DEPTH | GeometryInstanceSurfaceDataCache::FLAG_PASS_OPAQUE | GeometryInstanceSurfaceDataCache::FLAG_PASS_ALPHA)) {
@@ -1201,6 +1227,20 @@ void RenderForwardClustered::_fill_render_list(RenderListType p_render_list, con
 
 	if (p_render_list == RENDER_LIST_OPAQUE && lightmap_captures_used) {
 		RD::get_singleton()->buffer_update(scene_state.lightmap_capture_buffer, 0, sizeof(LightmapCaptureData) * lightmap_captures_used, scene_state.lightmap_captures);
+	}
+
+	if (r_opaque_primitives) {
+		// DUMBAI: Expose opaque/depth primitive pressure from list build so pass timings can be normalized by geometry volume.
+		*r_opaque_primitives = opaque_primitives;
+	}
+	if (r_alpha_primitives) {
+		*r_alpha_primitives = alpha_primitives;
+	}
+	if (r_motion_primitives) {
+		*r_motion_primitives = motion_primitives;
+	}
+	if (r_shadow_primitives) {
+		*r_shadow_primitives = shadow_primitives;
 	}
 }
 
@@ -1253,8 +1293,56 @@ void RenderForwardClustered::_setup_lightmaps(const RenderDataRD *p_render_data,
 
 /* SDFGI */
 
+uint32_t RenderForwardClustered::_get_sdfgi_benchmark_update_interval_frames() const {
+	static const String sdfgi_update_interval_setting = "rendering/driver/sdfgi/benchmark_update_interval_frames";
+	ProjectSettings *project_settings = ProjectSettings::get_singleton();
+	if (project_settings == nullptr || !project_settings->has_setting(sdfgi_update_interval_setting)) {
+		return 1;
+	}
+
+	int configured_interval = int(project_settings->get_setting_with_override(sdfgi_update_interval_setting));
+	// DUMBAI: Clamp override range so malformed settings cannot disable updates forever or overflow cadence math.
+	configured_interval = CLAMP(configured_interval, 1, 1024);
+	return uint32_t(configured_interval);
+}
+
+int RenderForwardClustered::_get_sdfgi_benchmark_max_regions_per_frame() const {
+	static const String sdfgi_max_regions_setting = "rendering/driver/sdfgi/benchmark_max_regions_per_frame";
+	ProjectSettings *project_settings = ProjectSettings::get_singleton();
+	if (project_settings == nullptr || !project_settings->has_setting(sdfgi_max_regions_setting)) {
+		return 0;
+	}
+
+	int configured_max_regions = int(project_settings->get_setting_with_override(sdfgi_max_regions_setting));
+	// DUMBAI: Treat 0 as unlimited; otherwise clamp to a sane benchmark-only cap so malformed values cannot explode work scheduling.
+	configured_max_regions = CLAMP(configured_max_regions, 0, 1024);
+	return configured_max_regions;
+}
+
+bool RenderForwardClustered::_should_run_sdfgi_benchmark_update(uint32_t p_update_interval_frames, uint64_t p_frame_index) const {
+	if (p_update_interval_frames <= 1) {
+		return true;
+	}
+	// DUMBAI: Frame index is 1-based, so execute on frame 1 then every Nth frame to keep throttle cadence deterministic.
+	return ((p_frame_index - 1) % uint64_t(p_update_interval_frames)) == 0;
+}
+
 void RenderForwardClustered::_update_sdfgi(RenderDataRD *p_render_data) {
 	if (p_render_data->sdfgi_update_data == nullptr) {
+		return;
+	}
+
+	sdfgi_benchmark_metrics.regions_requested = uint64_t(MAX(0, p_render_data->render_sdfgi_region_count));
+	if (p_render_data->sdfgi_update_data->update_static) {
+		sdfgi_benchmark_metrics.static_cascades_requested = uint64_t(p_render_data->sdfgi_update_data->static_cascade_count);
+		if (p_render_data->sdfgi_update_data->static_positional_lights != nullptr) {
+			sdfgi_benchmark_metrics.static_lights_requested = uint64_t(p_render_data->sdfgi_update_data->static_positional_lights->size());
+		}
+	}
+
+	if (!_should_run_sdfgi_benchmark_update(uint32_t(sdfgi_benchmark_metrics.update_interval_frames), sdfgi_benchmark_metrics.frame_index)) {
+		// DUMBAI: Skip SDFGI region/static update work on throttled frames to bound GI update cost during benchmark A/B runs.
+		sdfgi_benchmark_metrics.update_skipped = true;
 		return;
 	}
 
@@ -1264,6 +1352,7 @@ void RenderForwardClustered::_update_sdfgi(RenderDataRD *p_render_data) {
 	}
 
 	if (rb.is_valid() && rb->has_custom_data(RB_SCOPE_SDFGI)) {
+		const uint64_t total_start_usec = OS::get_singleton()->get_ticks_usec();
 		RENDER_TIMESTAMP("Render SDFGI");
 		Ref<RendererRD::GI::SDFGI> sdfgi = rb->get_custom_data(RB_SCOPE_SDFGI);
 		float exposure_normalization = 1.0;
@@ -1271,12 +1360,35 @@ void RenderForwardClustered::_update_sdfgi(RenderDataRD *p_render_data) {
 		if (p_render_data->camera_attributes.is_valid()) {
 			exposure_normalization = RSG::camera_attributes->camera_attributes_get_exposure_normalization_factor(p_render_data->camera_attributes);
 		}
-		for (int i = 0; i < p_render_data->render_sdfgi_region_count; i++) {
-			sdfgi->render_region(rb, p_render_data->render_sdfgi_regions[i].region, p_render_data->render_sdfgi_regions[i].instances, exposure_normalization);
+		const int max_regions_per_frame = _get_sdfgi_benchmark_max_regions_per_frame();
+		int regions_to_render = p_render_data->render_sdfgi_region_count;
+		if (max_regions_per_frame > 0) {
+			regions_to_render = MIN(regions_to_render, max_regions_per_frame);
 		}
+		const uint64_t regions_start_usec = OS::get_singleton()->get_ticks_usec();
+		for (int i = 0; i < regions_to_render; i++) {
+			int region_index = i;
+			if (regions_to_render < p_render_data->render_sdfgi_region_count) {
+				// DUMBAI: Rotate which pending regions are processed when capped so one region cannot monopolize all update frames.
+				region_index = int((sdfgi_benchmark_metrics.frame_index - 1 + uint64_t(i)) % uint64_t(p_render_data->render_sdfgi_region_count));
+			}
+			sdfgi->render_region(rb, p_render_data->render_sdfgi_regions[region_index].region, p_render_data->render_sdfgi_regions[region_index].instances, exposure_normalization);
+			sdfgi_benchmark_metrics.regions_rendered += 1;
+		}
+		const uint64_t regions_end_usec = OS::get_singleton()->get_ticks_usec();
+		sdfgi_benchmark_metrics.region_render_cpu_ms = double(regions_end_usec - regions_start_usec) / 1000.0;
+
 		if (p_render_data->sdfgi_update_data->update_static) {
+			const uint64_t static_start_usec = OS::get_singleton()->get_ticks_usec();
 			sdfgi->render_static_lights(p_render_data, rb, p_render_data->sdfgi_update_data->static_cascade_count, p_render_data->sdfgi_update_data->static_cascade_indices, p_render_data->sdfgi_update_data->static_positional_lights);
+			const uint64_t static_end_usec = OS::get_singleton()->get_ticks_usec();
+			sdfgi_benchmark_metrics.static_light_cpu_ms = double(static_end_usec - static_start_usec) / 1000.0;
+			sdfgi_benchmark_metrics.static_cascades_rendered = uint64_t(p_render_data->sdfgi_update_data->static_cascade_count);
+			sdfgi_benchmark_metrics.static_lights_rendered = sdfgi_benchmark_metrics.static_lights_requested;
 		}
+		const uint64_t total_end_usec = OS::get_singleton()->get_ticks_usec();
+		sdfgi_benchmark_metrics.total_cpu_ms += double(total_end_usec - total_start_usec) / 1000.0;
+		sdfgi_benchmark_metrics.update_executed = true;
 	}
 }
 
@@ -1545,6 +1657,28 @@ void RenderForwardClustered::_pre_opaque_render(RenderDataRD *p_render_data, boo
 	p_render_data->directional_shadows.clear();
 
 	float lod_distance_multiplier = p_render_data->scene_data->cam_projection.get_lod_multiplier();
+	uint64_t directional_shadow_draw_calls = 0;
+	uint64_t positional_shadow_draw_calls = 0;
+	uint64_t omni_cube_shadow_draw_calls = 0;
+	uint64_t directional_shadow_primitives = 0;
+	uint64_t positional_shadow_primitives = 0;
+	uint64_t omni_cube_shadow_primitives = 0;
+	auto read_shadow_info = [&](RSE::ViewportRenderInfo p_info) -> uint64_t {
+		if (p_render_data->render_info == nullptr) {
+			return 0;
+		}
+		const int value = p_render_data->render_info->info[RSE::VIEWPORT_RENDER_INFO_TYPE_SHADOW][p_info];
+		return value > 0 ? uint64_t(value) : 0;
+	};
+	auto accumulate_shadow_delta = [&](uint64_t p_draw_before, uint64_t p_primitive_before, uint64_t &r_draw_total, uint64_t &r_primitive_total) {
+		if (p_render_data->render_info == nullptr) {
+			return;
+		}
+		const uint64_t draw_after = read_shadow_info(RSE::VIEWPORT_RENDER_INFO_DRAW_CALLS_IN_FRAME);
+		const uint64_t primitive_after = read_shadow_info(RSE::VIEWPORT_RENDER_INFO_PRIMITIVES_IN_FRAME);
+		r_draw_total += draw_after >= p_draw_before ? draw_after - p_draw_before : 0;
+		r_primitive_total += primitive_after >= p_primitive_before ? primitive_after - p_primitive_before : 0;
+	};
 	{
 		for (int i = 0; i < p_render_data->render_shadow_count; i++) {
 			RID li = p_render_data->render_shadows[i].light;
@@ -1559,12 +1693,13 @@ void RenderForwardClustered::_pre_opaque_render(RenderDataRD *p_render_data, boo
 			}
 		}
 
-		if (p_render_data->cube_shadows.size()) {
-			RENDER_TIMESTAMP("Render OmniLight Shadows");
-			// Cube shadows are rendered in their own way.
-			for (const int &index : p_render_data->cube_shadows) {
-				_render_shadow_pass(p_render_data->render_shadows[index].light, p_render_data->shadow_atlas, p_render_data->render_shadows[index].pass, p_render_data->render_shadows[index].instances, lod_distance_multiplier, p_render_data->scene_data->screen_mesh_lod_threshold, true, true, true, p_render_data->render_info, viewport_size, p_render_data->scene_data->cam_transform);
-			}
+		RENDER_TIMESTAMP("Render OmniLight Shadows");
+		// Cube shadows are rendered in their own way.
+		for (const int &index : p_render_data->cube_shadows) {
+			const uint64_t shadow_draw_before = read_shadow_info(RSE::VIEWPORT_RENDER_INFO_DRAW_CALLS_IN_FRAME);
+			const uint64_t shadow_primitives_before = read_shadow_info(RSE::VIEWPORT_RENDER_INFO_PRIMITIVES_IN_FRAME);
+			_render_shadow_pass(p_render_data->render_shadows[index].light, p_render_data->shadow_atlas, p_render_data->render_shadows[index].pass, p_render_data->render_shadows[index].instances, lod_distance_multiplier, p_render_data->scene_data->screen_mesh_lod_threshold, true, true, true, p_render_data->render_info, viewport_size, p_render_data->scene_data->cam_transform);
+			accumulate_shadow_delta(shadow_draw_before, shadow_primitives_before, omni_cube_shadow_draw_calls, omni_cube_shadow_primitives);
 		}
 
 		if (p_render_data->directional_shadows.size()) {
@@ -1580,10 +1715,34 @@ void RenderForwardClustered::_pre_opaque_render(RenderDataRD *p_render_data, boo
 	bool render_shadows = p_render_data->directional_shadows.size() || p_render_data->shadows.size();
 	bool render_gi = rb.is_valid() && p_use_gi;
 
+	uint64_t directional_shadow_instances = 0;
+	for (const int &shadow_index : p_render_data->directional_shadows) {
+		directional_shadow_instances += uint64_t(p_render_data->render_shadows[shadow_index].instances.size());
+	}
+	uint64_t positional_shadow_instances = 0;
+	for (const int &shadow_index : p_render_data->shadows) {
+		positional_shadow_instances += uint64_t(p_render_data->render_shadows[shadow_index].instances.size());
+	}
+	uint64_t omni_cube_shadow_instances = 0;
+	for (const int &shadow_index : p_render_data->cube_shadows) {
+		omni_cube_shadow_instances += uint64_t(p_render_data->render_shadows[shadow_index].instances.size());
+	}
+
+	{
+		MutexLock lock(benchmark_workload_snapshot_mutex);
+		// DUMBAI: Snapshot exact shadow pass and caster-instance counts so benchmark logs can map shadow stage GPU cost to real pass pressure.
+		benchmark_workload_snapshot.shadow_directional_passes = uint64_t(p_render_data->directional_shadows.size());
+		benchmark_workload_snapshot.shadow_positional_passes = uint64_t(p_render_data->shadows.size());
+		benchmark_workload_snapshot.shadow_omni_cube_passes = uint64_t(p_render_data->cube_shadows.size());
+		benchmark_workload_snapshot.shadow_directional_instances = directional_shadow_instances;
+		benchmark_workload_snapshot.shadow_positional_instances = positional_shadow_instances;
+		benchmark_workload_snapshot.shadow_omni_cube_instances = omni_cube_shadow_instances;
+	}
+
 	if (render_shadows && render_gi) {
-		RENDER_TIMESTAMP("Render GI + Render Directional/SpotLight Shadows (Parallel)");
+		RENDER_TIMESTAMP("Render GI + Render Shadows (Parallel)");
 	} else if (render_shadows) {
-		RENDER_TIMESTAMP("Render Directional/SpotLight Shadows");
+		RENDER_TIMESTAMP("Render Shadows");
 	} else if (render_gi) {
 		RENDER_TIMESTAMP("Render GI");
 	}
@@ -1594,11 +1753,17 @@ void RenderForwardClustered::_pre_opaque_render(RenderDataRD *p_render_data, boo
 
 		//render directional shadows
 		for (uint32_t i = 0; i < p_render_data->directional_shadows.size(); i++) {
+			const uint64_t shadow_draw_before = read_shadow_info(RSE::VIEWPORT_RENDER_INFO_DRAW_CALLS_IN_FRAME);
+			const uint64_t shadow_primitives_before = read_shadow_info(RSE::VIEWPORT_RENDER_INFO_PRIMITIVES_IN_FRAME);
 			_render_shadow_pass(p_render_data->render_shadows[p_render_data->directional_shadows[i]].light, p_render_data->shadow_atlas, p_render_data->render_shadows[p_render_data->directional_shadows[i]].pass, p_render_data->render_shadows[p_render_data->directional_shadows[i]].instances, lod_distance_multiplier, p_render_data->scene_data->screen_mesh_lod_threshold, false, i == p_render_data->directional_shadows.size() - 1, false, p_render_data->render_info, viewport_size, p_render_data->scene_data->cam_transform);
+			accumulate_shadow_delta(shadow_draw_before, shadow_primitives_before, directional_shadow_draw_calls, directional_shadow_primitives);
 		}
 		//render positional shadows
 		for (uint32_t i = 0; i < p_render_data->shadows.size(); i++) {
+			const uint64_t shadow_draw_before = read_shadow_info(RSE::VIEWPORT_RENDER_INFO_DRAW_CALLS_IN_FRAME);
+			const uint64_t shadow_primitives_before = read_shadow_info(RSE::VIEWPORT_RENDER_INFO_PRIMITIVES_IN_FRAME);
 			_render_shadow_pass(p_render_data->render_shadows[p_render_data->shadows[i]].light, p_render_data->shadow_atlas, p_render_data->render_shadows[p_render_data->shadows[i]].pass, p_render_data->render_shadows[p_render_data->shadows[i]].instances, lod_distance_multiplier, p_render_data->scene_data->screen_mesh_lod_threshold, i == 0, i == p_render_data->shadows.size() - 1, true, p_render_data->render_info, viewport_size, p_render_data->scene_data->cam_transform);
+			accumulate_shadow_delta(shadow_draw_before, shadow_primitives_before, positional_shadow_draw_calls, positional_shadow_primitives);
 		}
 
 		_render_shadow_process();
@@ -1671,6 +1836,20 @@ void RenderForwardClustered::_pre_opaque_render(RenderDataRD *p_render_data, boo
 
 	p_render_data->directional_light_count = directional_light_count;
 
+	{
+		MutexLock lock(benchmark_workload_snapshot_mutex);
+		// DUMBAI: Track directional/positional light counts alongside pass sizes to quantify clustered-light pressure per benchmark phase.
+		benchmark_workload_snapshot.directional_light_count = directional_light_count;
+		benchmark_workload_snapshot.positional_light_count = positional_light_count;
+		// DUMBAI: Record per-pass shadow draw/primitive deltas so shadow bottlenecks can be compared against pass workload instead of only total caster count.
+		benchmark_workload_snapshot.shadow_directional_draw_calls = directional_shadow_draw_calls;
+		benchmark_workload_snapshot.shadow_positional_draw_calls = positional_shadow_draw_calls;
+		benchmark_workload_snapshot.shadow_omni_cube_draw_calls = omni_cube_shadow_draw_calls;
+		benchmark_workload_snapshot.shadow_directional_primitives = directional_shadow_primitives;
+		benchmark_workload_snapshot.shadow_positional_primitives = positional_shadow_primitives;
+		benchmark_workload_snapshot.shadow_omni_cube_primitives = omni_cube_shadow_primitives;
+	}
+
 	if (current_cluster_builder) {
 		current_cluster_builder->bake_cluster();
 	}
@@ -1708,6 +1887,16 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 	RendererRD::LightStorage *light_storage = RendererRD::LightStorage::get_singleton();
 
 	ERR_FAIL_NULL(p_render_data);
+
+	// DUMBAI: Sample SDFGI throttle setting once per frame so all SDFGI sub-passes share one deterministic cadence decision.
+	sdfgi_benchmark_metrics = SDFGIBenchmarkFrameMetrics();
+	sdfgi_benchmark_metrics.frame_index = ++sdfgi_benchmark_frame_counter;
+	sdfgi_benchmark_metrics.update_interval_frames = _get_sdfgi_benchmark_update_interval_frames();
+	sdfgi_benchmark_metrics.budget_throttled = sdfgi_benchmark_metrics.update_interval_frames > 1;
+	const bool run_sdfgi_update_this_frame = _should_run_sdfgi_benchmark_update(uint32_t(sdfgi_benchmark_metrics.update_interval_frames), sdfgi_benchmark_metrics.frame_index);
+	if (!run_sdfgi_update_this_frame) {
+		sdfgi_benchmark_metrics.update_skipped = true;
+	}
 
 	Ref<RenderSceneBuffersRD> rb = p_render_data->render_buffers;
 	ERR_FAIL_COND(rb.is_null());
@@ -1756,9 +1945,28 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 		if (rb->has_custom_data(RB_SCOPE_SDFGI)) {
 			Ref<RendererRD::GI::SDFGI> sdfgi = rb->get_custom_data(RB_SCOPE_SDFGI);
 			if (sdfgi.is_valid()) {
-				sdfgi->update_cascades();
-				sdfgi->pre_process_gi(p_render_data->scene_data->cam_transform, p_render_data);
-				sdfgi->update_light();
+				if (run_sdfgi_update_this_frame) {
+					const uint64_t update_cascades_start_usec = OS::get_singleton()->get_ticks_usec();
+					sdfgi->update_cascades();
+					const uint64_t update_cascades_end_usec = OS::get_singleton()->get_ticks_usec();
+					sdfgi_benchmark_metrics.update_cascades_calls = 1;
+					sdfgi_benchmark_metrics.update_cascades_cpu_ms = double(update_cascades_end_usec - update_cascades_start_usec) / 1000.0;
+
+					const uint64_t pre_process_start_usec = OS::get_singleton()->get_ticks_usec();
+					sdfgi->pre_process_gi(p_render_data->scene_data->cam_transform, p_render_data);
+					const uint64_t pre_process_end_usec = OS::get_singleton()->get_ticks_usec();
+					sdfgi_benchmark_metrics.pre_process_calls = 1;
+					sdfgi_benchmark_metrics.pre_process_cpu_ms = double(pre_process_end_usec - pre_process_start_usec) / 1000.0;
+
+					const uint64_t update_light_start_usec = OS::get_singleton()->get_ticks_usec();
+					sdfgi->update_light();
+					const uint64_t update_light_end_usec = OS::get_singleton()->get_ticks_usec();
+					sdfgi_benchmark_metrics.update_light_calls = 1;
+					sdfgi_benchmark_metrics.update_light_cpu_ms = double(update_light_end_usec - update_light_start_usec) / 1000.0;
+
+					sdfgi_benchmark_metrics.total_cpu_ms += sdfgi_benchmark_metrics.update_cascades_cpu_ms + sdfgi_benchmark_metrics.pre_process_cpu_ms + sdfgi_benchmark_metrics.update_light_cpu_ms;
+					sdfgi_benchmark_metrics.update_executed = true;
+				}
 			}
 		}
 
@@ -1912,15 +2120,95 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 	// May have changed due to the above (light buffer enlarged, as an example).
 	_update_render_base_uniform_set();
 
-	_fill_render_list(RENDER_LIST_OPAQUE, p_render_data, PASS_MODE_COLOR, using_sdfgi, using_sdfgi || using_voxelgi, using_motion_pass);
+	uint64_t opaque_primitives = 0;
+	uint64_t transparent_primitives = 0;
+	uint64_t motion_primitives = 0;
+	_fill_render_list(RENDER_LIST_OPAQUE, p_render_data, PASS_MODE_COLOR, using_sdfgi, using_sdfgi || using_voxelgi, using_motion_pass, false, &opaque_primitives, &transparent_primitives, &motion_primitives);
 	render_list[RENDER_LIST_OPAQUE].sort_by_key();
 	render_list[RENDER_LIST_MOTION].sort_by_key();
 	render_list[RENDER_LIST_ALPHA].sort_by_reverse_depth_and_priority();
 
 	int *render_info = p_render_data->render_info ? p_render_data->render_info->info[RSE::VIEWPORT_RENDER_INFO_TYPE_VISIBLE] : (int *)nullptr;
-	_fill_instance_data(RENDER_LIST_OPAQUE, render_info);
-	_fill_instance_data(RENDER_LIST_MOTION, render_info);
-	_fill_instance_data(RENDER_LIST_ALPHA, render_info);
+	uint64_t opaque_draw_calls = 0;
+	uint64_t motion_draw_calls = 0;
+	uint64_t transparent_draw_calls = 0;
+	_fill_instance_data(RENDER_LIST_OPAQUE, render_info, 0, -1, true, &opaque_draw_calls);
+	_fill_instance_data(RENDER_LIST_MOTION, render_info, 0, -1, true, &motion_draw_calls);
+	_fill_instance_data(RENDER_LIST_ALPHA, render_info, 0, -1, true, &transparent_draw_calls);
+
+	{
+		MutexLock lock(benchmark_workload_snapshot_mutex);
+		// DUMBAI: Capture per-list element counts after culling/sorting so transparent vs opaque load can be compared directly against GPU stage timings.
+		benchmark_workload_snapshot.opaque_elements = uint64_t(render_list[RENDER_LIST_OPAQUE].elements.size());
+		benchmark_workload_snapshot.transparent_elements = uint64_t(render_list[RENDER_LIST_ALPHA].elements.size());
+		benchmark_workload_snapshot.motion_elements = uint64_t(render_list[RENDER_LIST_MOTION].elements.size());
+		benchmark_workload_snapshot.total_visible_elements = benchmark_workload_snapshot.opaque_elements + benchmark_workload_snapshot.transparent_elements + benchmark_workload_snapshot.motion_elements;
+		benchmark_workload_snapshot.opaque_draw_calls = opaque_draw_calls;
+		benchmark_workload_snapshot.transparent_draw_calls = transparent_draw_calls;
+		benchmark_workload_snapshot.motion_draw_calls = motion_draw_calls;
+		benchmark_workload_snapshot.depth_prepass_policy = uint64_t(GLOBAL_GET_CACHED(int, "rendering/driver/depth_prepass/policy"));
+		// DUMBAI: Depth prepass reuses opaque list submission, so draw/primitive pressure mirrors opaque list workload.
+		benchmark_workload_snapshot.depth_prepass_draw_calls = opaque_draw_calls;
+		benchmark_workload_snapshot.opaque_primitives = opaque_primitives;
+		benchmark_workload_snapshot.transparent_primitives = transparent_primitives;
+		benchmark_workload_snapshot.motion_primitives = motion_primitives;
+		benchmark_workload_snapshot.depth_prepass_primitives = opaque_primitives;
+		benchmark_workload_snapshot.render_shadow_count = uint64_t(p_render_data->render_shadow_count);
+		benchmark_workload_snapshot.cluster_max_elements = uint64_t(p_render_data->cluster_max_elements);
+		benchmark_workload_snapshot.view_count = uint64_t(p_render_data->scene_data->view_count);
+		benchmark_workload_snapshot.using_sdfgi = using_sdfgi;
+		benchmark_workload_snapshot.using_voxelgi = using_voxelgi;
+		benchmark_workload_snapshot.using_ssr = using_ssr;
+		benchmark_workload_snapshot.using_ssil = using_ssil;
+		benchmark_workload_snapshot.using_motion_pass = using_motion_pass;
+		benchmark_workload_snapshot.rendering_reflection_probe = is_reflection_probe;
+		benchmark_workload_snapshot.depth_prepass_enabled = false;
+		benchmark_workload_snapshot.depth_prepass_forced_by_stencil = false;
+		benchmark_workload_snapshot.depth_prepass_requested_by_setting = false;
+		benchmark_workload_snapshot.depth_prepass_has_framebuffer = false;
+		benchmark_workload_snapshot.depth_prepass_finish_depth = false;
+		benchmark_workload_snapshot.depth_prepass_reason_ssao = false;
+		benchmark_workload_snapshot.depth_prepass_reason_ssil = false;
+		benchmark_workload_snapshot.depth_prepass_reason_sdfgi = false;
+		benchmark_workload_snapshot.depth_prepass_reason_voxelgi = false;
+		benchmark_workload_snapshot.depth_prepass_reason_ce_pre_opaque_resolved_depth = false;
+		benchmark_workload_snapshot.depth_prepass_reason_ce_post_opaque_resolved_depth = false;
+		// DUMBAI: Reset these each frame before shadow setup to avoid stale carry-over when the next frame has fewer/no shadow passes.
+		benchmark_workload_snapshot.shadow_directional_passes = 0;
+		benchmark_workload_snapshot.shadow_positional_passes = 0;
+		benchmark_workload_snapshot.shadow_omni_cube_passes = 0;
+		benchmark_workload_snapshot.shadow_directional_instances = 0;
+		benchmark_workload_snapshot.shadow_positional_instances = 0;
+		benchmark_workload_snapshot.shadow_omni_cube_instances = 0;
+		benchmark_workload_snapshot.shadow_directional_draw_calls = 0;
+		benchmark_workload_snapshot.shadow_positional_draw_calls = 0;
+		benchmark_workload_snapshot.shadow_omni_cube_draw_calls = 0;
+		benchmark_workload_snapshot.shadow_directional_primitives = 0;
+		benchmark_workload_snapshot.shadow_positional_primitives = 0;
+		benchmark_workload_snapshot.shadow_omni_cube_primitives = 0;
+		benchmark_workload_snapshot.directional_light_count = 0;
+		benchmark_workload_snapshot.positional_light_count = 0;
+		benchmark_workload_snapshot.sdfgi_frame_index = sdfgi_benchmark_metrics.frame_index;
+		benchmark_workload_snapshot.sdfgi_update_interval_frames = sdfgi_benchmark_metrics.update_interval_frames;
+		benchmark_workload_snapshot.sdfgi_regions_requested = sdfgi_benchmark_metrics.regions_requested;
+		benchmark_workload_snapshot.sdfgi_regions_rendered = sdfgi_benchmark_metrics.regions_rendered;
+		benchmark_workload_snapshot.sdfgi_static_cascades_requested = sdfgi_benchmark_metrics.static_cascades_requested;
+		benchmark_workload_snapshot.sdfgi_static_cascades_rendered = sdfgi_benchmark_metrics.static_cascades_rendered;
+		benchmark_workload_snapshot.sdfgi_static_lights_requested = sdfgi_benchmark_metrics.static_lights_requested;
+		benchmark_workload_snapshot.sdfgi_static_lights_rendered = sdfgi_benchmark_metrics.static_lights_rendered;
+		benchmark_workload_snapshot.sdfgi_update_cascades_calls = sdfgi_benchmark_metrics.update_cascades_calls;
+		benchmark_workload_snapshot.sdfgi_pre_process_calls = sdfgi_benchmark_metrics.pre_process_calls;
+		benchmark_workload_snapshot.sdfgi_update_light_calls = sdfgi_benchmark_metrics.update_light_calls;
+		benchmark_workload_snapshot.sdfgi_region_render_cpu_ms = sdfgi_benchmark_metrics.region_render_cpu_ms;
+		benchmark_workload_snapshot.sdfgi_static_light_cpu_ms = sdfgi_benchmark_metrics.static_light_cpu_ms;
+		benchmark_workload_snapshot.sdfgi_update_cascades_cpu_ms = sdfgi_benchmark_metrics.update_cascades_cpu_ms;
+		benchmark_workload_snapshot.sdfgi_pre_process_cpu_ms = sdfgi_benchmark_metrics.pre_process_cpu_ms;
+		benchmark_workload_snapshot.sdfgi_update_light_cpu_ms = sdfgi_benchmark_metrics.update_light_cpu_ms;
+		benchmark_workload_snapshot.sdfgi_total_cpu_ms = sdfgi_benchmark_metrics.total_cpu_ms;
+		benchmark_workload_snapshot.sdfgi_budget_throttled = sdfgi_benchmark_metrics.budget_throttled;
+		benchmark_workload_snapshot.sdfgi_update_executed = sdfgi_benchmark_metrics.update_executed;
+		benchmark_workload_snapshot.sdfgi_update_skipped = sdfgi_benchmark_metrics.update_skipped;
+	}
 
 	RD::get_singleton()->draw_command_end_label();
 
@@ -2111,13 +2399,30 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 
 	bool debug_voxelgis = get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_VOXEL_GI_ALBEDO || get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_VOXEL_GI_LIGHTING || get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_VOXEL_GI_EMISSION;
 	bool debug_sdfgi_probes = get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_SDFGI_PROBES;
+	bool depth_prepass_requested_by_setting = bool(GLOBAL_GET_CACHED(bool, "rendering/driver/depth_prepass/enable"));
+	bool depth_prepass_has_framebuffer = depth_framebuffer.is_valid();
 	bool force_depth_pre_pass = scene_state.used_opaque_stencil;
-	bool depth_pre_pass = (force_depth_pre_pass || bool(GLOBAL_GET_CACHED(bool, "rendering/driver/depth_prepass/enable"))) && depth_framebuffer.is_valid();
+	bool depth_pre_pass = (force_depth_pre_pass || depth_prepass_requested_by_setting) && depth_prepass_has_framebuffer;
 
 	SceneShaderForwardClustered::ShaderSpecialization base_specialization = scene_shader.default_specialization;
 	base_specialization.use_depth_fog = p_render_data->environment.is_valid() && environment_get_fog_mode(p_render_data->environment) == RSE::EnvironmentFogMode::ENV_FOG_MODE_DEPTH;
 
 	bool using_ssao = depth_pre_pass && !is_reflection_probe && p_render_data->environment.is_valid() && environment_get_ssao_enabled(p_render_data->environment);
+
+	{
+		MutexLock lock(benchmark_workload_snapshot_mutex);
+		// DUMBAI: Export real depth prepass state/reasons so BENCH logs do not infer stale/default values.
+		benchmark_workload_snapshot.depth_prepass_enabled = depth_pre_pass;
+		benchmark_workload_snapshot.depth_prepass_forced_by_stencil = force_depth_pre_pass;
+		benchmark_workload_snapshot.depth_prepass_requested_by_setting = depth_prepass_requested_by_setting;
+		benchmark_workload_snapshot.depth_prepass_has_framebuffer = depth_prepass_has_framebuffer;
+		benchmark_workload_snapshot.depth_prepass_reason_ssao = using_ssao;
+		benchmark_workload_snapshot.depth_prepass_reason_ssil = using_ssil;
+		benchmark_workload_snapshot.depth_prepass_reason_sdfgi = using_sdfgi;
+		benchmark_workload_snapshot.depth_prepass_reason_voxelgi = using_voxelgi;
+		benchmark_workload_snapshot.depth_prepass_reason_ce_pre_opaque_resolved_depth = ce_pre_opaque_resolved_depth;
+		benchmark_workload_snapshot.depth_prepass_reason_ce_post_opaque_resolved_depth = ce_post_opaque_resolved_depth;
+	}
 
 	if (depth_pre_pass) { //depth pre pass
 		bool needs_pre_resolve = _needs_post_prepass_render(p_render_data, using_sdfgi || using_voxelgi);
@@ -2139,6 +2444,11 @@ void RenderForwardClustered::_render_scene(RenderDataRD *p_render_data, const Co
 		RID rp_uniform_set = _setup_render_pass_uniform_set(RENDER_LIST_OPAQUE, nullptr, is_multiview, RID(), samplers, depth_prepass_uniform_buffer_index);
 
 		bool finish_depth = using_ssao || using_ssil || using_sdfgi || using_voxelgi || ce_pre_opaque_resolved_depth || ce_post_opaque_resolved_depth;
+		{
+			MutexLock lock(benchmark_workload_snapshot_mutex);
+			// DUMBAI: Record whether the depth resolve path is needed to interpret depth prepass GPU cost correctly.
+			benchmark_workload_snapshot.depth_prepass_finish_depth = finish_depth;
+		}
 		RenderListParameters render_list_params(render_list[RENDER_LIST_OPAQUE].elements.ptr(), render_list[RENDER_LIST_OPAQUE].element_info.ptr(), render_list[RENDER_LIST_OPAQUE].elements.size(), reverse_cull, depth_pass_mode, 0, rb_data.is_null(), p_render_data->directional_light_soft_shadows, rp_uniform_set, get_debug_draw_mode() == RSE::VIEWPORT_DEBUG_DRAW_WIREFRAME, Vector2(), p_render_data->scene_data->lod_distance_multiplier, p_render_data->scene_data->screen_mesh_lod_threshold, p_render_data->scene_data->view_count, 0, base_specialization);
 		_render_list_with_draw_list(&render_list_params, depth_framebuffer, RD::DrawFlags(needs_pre_resolve ? RD::DRAW_DEFAULT_ALL : RD::DRAW_CLEAR_ALL), depth_pass_clear, 0.0f, 0u, p_render_data->render_region);
 
@@ -4022,6 +4332,80 @@ void RenderForwardClustered::sub_surface_scattering_set_scale(float p_scale, flo
 }
 
 RenderForwardClustered *RenderForwardClustered::singleton = nullptr;
+
+Dictionary RenderForwardClustered::get_benchmark_workload_snapshot() const {
+	Dictionary snapshot;
+	MutexLock lock(benchmark_workload_snapshot_mutex);
+	// DUMBAI: Keep exported field names stable so benchmark automation can parse run logs/CSVs without per-build schema churn.
+	snapshot["opaque_elements"] = benchmark_workload_snapshot.opaque_elements;
+	snapshot["transparent_elements"] = benchmark_workload_snapshot.transparent_elements;
+	snapshot["motion_elements"] = benchmark_workload_snapshot.motion_elements;
+	snapshot["total_visible_elements"] = benchmark_workload_snapshot.total_visible_elements;
+	snapshot["opaque_draw_calls"] = benchmark_workload_snapshot.opaque_draw_calls;
+	snapshot["transparent_draw_calls"] = benchmark_workload_snapshot.transparent_draw_calls;
+	snapshot["motion_draw_calls"] = benchmark_workload_snapshot.motion_draw_calls;
+	snapshot["depth_prepass_policy"] = benchmark_workload_snapshot.depth_prepass_policy;
+	snapshot["depth_prepass_draw_calls"] = benchmark_workload_snapshot.depth_prepass_draw_calls;
+	snapshot["opaque_primitives"] = benchmark_workload_snapshot.opaque_primitives;
+	snapshot["transparent_primitives"] = benchmark_workload_snapshot.transparent_primitives;
+	snapshot["motion_primitives"] = benchmark_workload_snapshot.motion_primitives;
+	snapshot["depth_prepass_primitives"] = benchmark_workload_snapshot.depth_prepass_primitives;
+	snapshot["shadow_directional_passes"] = benchmark_workload_snapshot.shadow_directional_passes;
+	snapshot["shadow_positional_passes"] = benchmark_workload_snapshot.shadow_positional_passes;
+	snapshot["shadow_omni_cube_passes"] = benchmark_workload_snapshot.shadow_omni_cube_passes;
+	snapshot["shadow_directional_instances"] = benchmark_workload_snapshot.shadow_directional_instances;
+	snapshot["shadow_positional_instances"] = benchmark_workload_snapshot.shadow_positional_instances;
+	snapshot["shadow_omni_cube_instances"] = benchmark_workload_snapshot.shadow_omni_cube_instances;
+	snapshot["shadow_directional_draw_calls"] = benchmark_workload_snapshot.shadow_directional_draw_calls;
+	snapshot["shadow_positional_draw_calls"] = benchmark_workload_snapshot.shadow_positional_draw_calls;
+	snapshot["shadow_omni_cube_draw_calls"] = benchmark_workload_snapshot.shadow_omni_cube_draw_calls;
+	snapshot["shadow_directional_primitives"] = benchmark_workload_snapshot.shadow_directional_primitives;
+	snapshot["shadow_positional_primitives"] = benchmark_workload_snapshot.shadow_positional_primitives;
+	snapshot["shadow_omni_cube_primitives"] = benchmark_workload_snapshot.shadow_omni_cube_primitives;
+	snapshot["render_shadow_count"] = benchmark_workload_snapshot.render_shadow_count;
+	snapshot["cluster_max_elements"] = benchmark_workload_snapshot.cluster_max_elements;
+	snapshot["view_count"] = benchmark_workload_snapshot.view_count;
+	snapshot["directional_light_count"] = benchmark_workload_snapshot.directional_light_count;
+	snapshot["positional_light_count"] = benchmark_workload_snapshot.positional_light_count;
+	snapshot["sdfgi_frame_index"] = benchmark_workload_snapshot.sdfgi_frame_index;
+	snapshot["sdfgi_update_interval_frames"] = benchmark_workload_snapshot.sdfgi_update_interval_frames;
+	snapshot["sdfgi_regions_requested"] = benchmark_workload_snapshot.sdfgi_regions_requested;
+	snapshot["sdfgi_regions_rendered"] = benchmark_workload_snapshot.sdfgi_regions_rendered;
+	snapshot["sdfgi_static_cascades_requested"] = benchmark_workload_snapshot.sdfgi_static_cascades_requested;
+	snapshot["sdfgi_static_cascades_rendered"] = benchmark_workload_snapshot.sdfgi_static_cascades_rendered;
+	snapshot["sdfgi_static_lights_requested"] = benchmark_workload_snapshot.sdfgi_static_lights_requested;
+	snapshot["sdfgi_static_lights_rendered"] = benchmark_workload_snapshot.sdfgi_static_lights_rendered;
+	snapshot["sdfgi_update_cascades_calls"] = benchmark_workload_snapshot.sdfgi_update_cascades_calls;
+	snapshot["sdfgi_pre_process_calls"] = benchmark_workload_snapshot.sdfgi_pre_process_calls;
+	snapshot["sdfgi_update_light_calls"] = benchmark_workload_snapshot.sdfgi_update_light_calls;
+	snapshot["sdfgi_region_render_cpu_ms"] = benchmark_workload_snapshot.sdfgi_region_render_cpu_ms;
+	snapshot["sdfgi_static_light_cpu_ms"] = benchmark_workload_snapshot.sdfgi_static_light_cpu_ms;
+	snapshot["sdfgi_update_cascades_cpu_ms"] = benchmark_workload_snapshot.sdfgi_update_cascades_cpu_ms;
+	snapshot["sdfgi_pre_process_cpu_ms"] = benchmark_workload_snapshot.sdfgi_pre_process_cpu_ms;
+	snapshot["sdfgi_update_light_cpu_ms"] = benchmark_workload_snapshot.sdfgi_update_light_cpu_ms;
+	snapshot["sdfgi_total_cpu_ms"] = benchmark_workload_snapshot.sdfgi_total_cpu_ms;
+	snapshot["using_sdfgi"] = benchmark_workload_snapshot.using_sdfgi;
+	snapshot["using_voxelgi"] = benchmark_workload_snapshot.using_voxelgi;
+	snapshot["using_ssr"] = benchmark_workload_snapshot.using_ssr;
+	snapshot["using_ssil"] = benchmark_workload_snapshot.using_ssil;
+	snapshot["using_motion_pass"] = benchmark_workload_snapshot.using_motion_pass;
+	snapshot["rendering_reflection_probe"] = benchmark_workload_snapshot.rendering_reflection_probe;
+	snapshot["depth_prepass_enabled"] = benchmark_workload_snapshot.depth_prepass_enabled;
+	snapshot["depth_prepass_forced_by_stencil"] = benchmark_workload_snapshot.depth_prepass_forced_by_stencil;
+	snapshot["depth_prepass_requested_by_setting"] = benchmark_workload_snapshot.depth_prepass_requested_by_setting;
+	snapshot["depth_prepass_has_framebuffer"] = benchmark_workload_snapshot.depth_prepass_has_framebuffer;
+	snapshot["depth_prepass_finish_depth"] = benchmark_workload_snapshot.depth_prepass_finish_depth;
+	snapshot["depth_prepass_reason_ssao"] = benchmark_workload_snapshot.depth_prepass_reason_ssao;
+	snapshot["depth_prepass_reason_ssil"] = benchmark_workload_snapshot.depth_prepass_reason_ssil;
+	snapshot["depth_prepass_reason_sdfgi"] = benchmark_workload_snapshot.depth_prepass_reason_sdfgi;
+	snapshot["depth_prepass_reason_voxelgi"] = benchmark_workload_snapshot.depth_prepass_reason_voxelgi;
+	snapshot["depth_prepass_reason_ce_pre_opaque_resolved_depth"] = benchmark_workload_snapshot.depth_prepass_reason_ce_pre_opaque_resolved_depth;
+	snapshot["depth_prepass_reason_ce_post_opaque_resolved_depth"] = benchmark_workload_snapshot.depth_prepass_reason_ce_post_opaque_resolved_depth;
+	snapshot["sdfgi_budget_throttled"] = benchmark_workload_snapshot.sdfgi_budget_throttled;
+	snapshot["sdfgi_update_executed"] = benchmark_workload_snapshot.sdfgi_update_executed;
+	snapshot["sdfgi_update_skipped"] = benchmark_workload_snapshot.sdfgi_update_skipped;
+	return snapshot;
+}
 
 void RenderForwardClustered::sdfgi_update(const Ref<RenderSceneBuffers> &p_render_buffers, RID p_environment, const Vector3 &p_world_position) {
 	Ref<RenderSceneBuffersRD> rb = p_render_buffers;

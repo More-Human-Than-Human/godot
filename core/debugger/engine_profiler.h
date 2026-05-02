@@ -32,6 +32,7 @@
 
 #include "core/object/gdvirtual.gen.h"
 #include "core/object/ref_counted.h"
+#include "core/variant/dictionary.h"
 
 class EngineProfiler : public RefCounted {
 	GDCLASS(EngineProfiler, RefCounted);
@@ -45,6 +46,7 @@ protected:
 public:
 	virtual void toggle(bool p_enable, const Array &p_opts);
 	virtual void add(const Array &p_data);
+	virtual void update(const Dictionary &p_data);
 	virtual void tick(double p_frame_time, double p_process_time, double p_physics_time, double p_physics_frame_time);
 
 	Error bind(const String &p_name);
@@ -53,6 +55,7 @@ public:
 
 	GDVIRTUAL2(_toggle, bool, Array);
 	GDVIRTUAL1(_add_frame, Array);
+	GDVIRTUAL1(_update, Dictionary);
 	GDVIRTUAL4(_tick, double, double, double, double);
 
 	virtual ~EngineProfiler();

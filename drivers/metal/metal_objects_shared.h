@@ -747,6 +747,9 @@ public:
 			VectorView<RDD::TextureBarrier> p_texture_barriers,
 			VectorView<RDD::AccelerationStructureBarrier> p_acceleration_structure_barriers) = 0;
 
+	// DUMBAI: Render graph timestamp capture needs backend-specific sampling while preserving the active encoder state.
+	virtual bool sample_timestamp(MTL::CounterSampleBuffer *p_sample_buffer, uint32_t p_sample_index) = 0;
+
 #pragma mark - Debugging
 
 	virtual void begin_label(const char *p_label_name, const Color &p_color) = 0;

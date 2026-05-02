@@ -45,6 +45,7 @@ STATIC_ASSERT_INCOMPLETE_TYPE(class, RenderingServer);
 #include "scene/animation/tween.h"
 #include "scene/debugger/scene_debugger.h"
 #include "scene/gui/control.h"
+#include "main/performance.h"
 #include "scene/main/multiplayer_api.h"
 #include "scene/main/node.h"
 #include "scene/main/viewport.h"
@@ -686,8 +687,28 @@ void SceneTree::iteration_end() {
 }
 
 bool SceneTree::process(double p_time) {
+	OS *os = OS::get_singleton();
+	CallQueue *main_message_queue = MessageQueue::get_singleton();
+
+	const uint64_t process_begin_usec = os->get_ticks_usec();
+	uint64_t stage_fti_usec = 0;
+	uint64_t stage_main_loop_usec = 0;
+	uint64_t stage_multiplayer_usec = 0;
+	uint64_t stage_signal_usec = 0;
+	uint64_t stage_message_queue_usec = 0;
+	uint64_t stage_transform_flush_usec = 0;
+	uint64_t stage_groups_usec = 0;
+	uint64_t stage_ugc_usec = 0;
+	uint64_t stage_scene_change_usec = 0;
+	uint64_t stage_timers_usec = 0;
+	uint64_t stage_tweens_usec = 0;
+	uint64_t stage_delete_queue_usec = 0;
+	uint64_t stage_accessibility_usec = 0;
+	uint64_t stage_idle_callbacks_usec = 0;
+
 	// First pass of scene tree fixed timestep interpolation.
 	if (get_scene_tree_fti().is_enabled()) {
+		uint64_t stage_begin_usec = os->get_ticks_usec();
 		// Special, we need to ensure RenderingServer is up to date
 		// with *all* the pending xforms *before* updating it during
 		// the FTI update.
@@ -695,48 +716,84 @@ bool SceneTree::process(double p_time) {
 		// overwriting the interpolated xform in the server.
 		flush_transform_notifications();
 		get_scene_tree_fti().frame_update(get_root(), true);
+		stage_fti_usec += os->get_ticks_usec() - stage_begin_usec;
 	}
 
+	uint64_t stage_begin_usec = os->get_ticks_usec();
 	if (MainLoop::process(p_time)) {
 		_quit = true;
 	}
+	stage_main_loop_usec = os->get_ticks_usec() - stage_begin_usec;
 
 	process_time = p_time;
 
 	if (multiplayer_poll) {
+		stage_begin_usec = os->get_ticks_usec();
 		multiplayer->poll();
 		for (KeyValue<NodePath, Ref<MultiplayerAPI>> &E : custom_multiplayers) {
 			E.value->poll();
 		}
+		stage_multiplayer_usec = os->get_ticks_usec() - stage_begin_usec;
 	}
 
+	stage_begin_usec = os->get_ticks_usec();
 	emit_signal(SNAME("process_frame"));
+	stage_signal_usec = os->get_ticks_usec() - stage_begin_usec;
 
-	MessageQueue::get_singleton()->flush(); //small little hack
+	stage_begin_usec = os->get_ticks_usec();
+	main_message_queue->flush(); //small little hack
+	stage_message_queue_usec += os->get_ticks_usec() - stage_begin_usec;
 
+	stage_begin_usec = os->get_ticks_usec();
 	flush_transform_notifications();
+	stage_transform_flush_usec += os->get_ticks_usec() - stage_begin_usec;
 
+	stage_begin_usec = os->get_ticks_usec();
 	_process(false);
+	stage_groups_usec = os->get_ticks_usec() - stage_begin_usec;
 
+	stage_begin_usec = os->get_ticks_usec();
 	_flush_ugc();
-	MessageQueue::get_singleton()->flush(); //small little hack
+	stage_ugc_usec = os->get_ticks_usec() - stage_begin_usec;
+
+	stage_begin_usec = os->get_ticks_usec();
+	main_message_queue->flush(); //small little hack
+	stage_message_queue_usec += os->get_ticks_usec() - stage_begin_usec;
+
+	stage_begin_usec = os->get_ticks_usec();
 	flush_transform_notifications(); //transforms after world update, to avoid unnecessary enter/exit notifications
+	stage_transform_flush_usec += os->get_ticks_usec() - stage_begin_usec;
 
 	if (unlikely(pending_new_scene_id.is_valid())) {
+		stage_begin_usec = os->get_ticks_usec();
 		_flush_scene_change();
+		stage_scene_change_usec = os->get_ticks_usec() - stage_begin_usec;
 	}
 
+	stage_begin_usec = os->get_ticks_usec();
 	process_timers(p_time, false); //go through timers
-	process_tweens(p_time, false);
+	stage_timers_usec = os->get_ticks_usec() - stage_begin_usec;
 
+	stage_begin_usec = os->get_ticks_usec();
+	process_tweens(p_time, false);
+	stage_tweens_usec = os->get_ticks_usec() - stage_begin_usec;
+
+	stage_begin_usec = os->get_ticks_usec();
 	flush_transform_notifications(); // Additional transforms after timers update.
+	stage_transform_flush_usec += os->get_ticks_usec() - stage_begin_usec;
 
 	// This should happen last because any processing that deletes something beforehand might expect the object to be removed in the same frame.
+	stage_begin_usec = os->get_ticks_usec();
 	_flush_delete_queue();
+	stage_delete_queue_usec = os->get_ticks_usec() - stage_begin_usec;
 
+	stage_begin_usec = os->get_ticks_usec();
 	_flush_accessibility_changes();
+	stage_accessibility_usec = os->get_ticks_usec() - stage_begin_usec;
 
+	stage_begin_usec = os->get_ticks_usec();
 	_call_idle_callbacks();
+	stage_idle_callbacks_usec = os->get_ticks_usec() - stage_begin_usec;
 
 #ifdef TOOLS_ENABLED
 #ifndef _3D_DISABLED
@@ -781,10 +838,51 @@ bool SceneTree::process(double p_time) {
 	// Second pass of scene tree fixed timestep interpolation.
 	// ToDo: Possibly needs another flush_transform_notifications here
 	// depending on whether there are side effects to _call_idle_callbacks().
+	stage_begin_usec = os->get_ticks_usec();
 	get_scene_tree_fti().frame_update(get_root(), false);
+	stage_fti_usec += os->get_ticks_usec() - stage_begin_usec;
 
 	if (_physics_interpolation_enabled) {
 		RenderingServer::get_singleton()->pre_draw(true);
+	}
+
+	const uint64_t process_total_usec = os->get_ticks_usec() - process_begin_usec;
+	const uint64_t process_tracked_usec =
+			stage_fti_usec +
+			stage_main_loop_usec +
+			stage_multiplayer_usec +
+			stage_signal_usec +
+			stage_message_queue_usec +
+			stage_transform_flush_usec +
+			stage_groups_usec +
+			stage_ugc_usec +
+			stage_scene_change_usec +
+			stage_timers_usec +
+			stage_tweens_usec +
+			stage_delete_queue_usec +
+			stage_accessibility_usec +
+			stage_idle_callbacks_usec;
+	// DUMBAI: Keep an explicit catch-all bucket so SceneTree timings can be reconciled against total process() wall time.
+	const uint64_t stage_other_usec = process_total_usec > process_tracked_usec ? process_total_usec - process_tracked_usec : 0;
+
+	// DUMBAI: Publish SceneTree sub-stage timings every frame so benchmark CSV can attribute _process bottlenecks precisely.
+	Performance *performance = Performance::get_singleton();
+	if (performance != nullptr) {
+		performance->set_process_scene_tree_fti_time((double)stage_fti_usec / 1000000.0);
+		performance->set_process_scene_tree_main_loop_time((double)stage_main_loop_usec / 1000000.0);
+		performance->set_process_scene_tree_multiplayer_time((double)stage_multiplayer_usec / 1000000.0);
+		performance->set_process_scene_tree_signal_time((double)stage_signal_usec / 1000000.0);
+		performance->set_process_scene_tree_message_queue_time((double)stage_message_queue_usec / 1000000.0);
+		performance->set_process_scene_tree_transform_flush_time((double)stage_transform_flush_usec / 1000000.0);
+		performance->set_process_scene_tree_groups_time((double)stage_groups_usec / 1000000.0);
+		performance->set_process_scene_tree_ugc_time((double)stage_ugc_usec / 1000000.0);
+		performance->set_process_scene_tree_scene_change_time((double)stage_scene_change_usec / 1000000.0);
+		performance->set_process_scene_tree_timers_time((double)stage_timers_usec / 1000000.0);
+		performance->set_process_scene_tree_tweens_time((double)stage_tweens_usec / 1000000.0);
+		performance->set_process_scene_tree_delete_queue_time((double)stage_delete_queue_usec / 1000000.0);
+		performance->set_process_scene_tree_accessibility_time((double)stage_accessibility_usec / 1000000.0);
+		performance->set_process_scene_tree_idle_callbacks_time((double)stage_idle_callbacks_usec / 1000000.0);
+		performance->set_process_scene_tree_other_time((double)stage_other_usec / 1000000.0);
 	}
 
 	return _quit;
@@ -1205,13 +1303,15 @@ void SceneTree::_process_group(ProcessGroup *p_group, bool p_physics) {
 
 	for (uint32_t i = 0; i < node_count; i++) {
 		Node *n = nodes_ptr[i];
-		if (nodes_removed_on_group_call.has(n)) {
+		// DUMBAI: Skip hash-table lookup in the hot loop when no removals happened during this group pass.
+		if (unlikely(!nodes_removed_on_group_call.is_empty()) && nodes_removed_on_group_call.has(n)) {
 			// Node may have been removed during process, skip it.
 			// Keep in mind removals can only happen on the main thread.
 			continue;
 		}
 
-		if (!n->can_process() || !n->is_inside_tree()) {
+		// DUMBAI: can_process() already checks is_inside_tree(), pause state, and suspension state.
+		if (!n->can_process()) {
 			continue;
 		}
 

@@ -195,29 +195,67 @@ void ScriptEditorDebugger::_file_selected(const String &p_file) {
 				ERR_PRINT("Failed to open " + p_file);
 				return;
 			}
+			Vector<StringName> monitor_names;
+			monitor_names.reserve(Performance::MONITOR_MAX + 5);
+
+			for (int i = 0; i < Performance::MONITOR_MAX; i++) {
+				monitor_names.push_back(Performance::get_singleton()->get_monitor_name(Performance::Monitor(i)));
+			}
+
+			// DUMBAI: Always include benchmark-required process substage columns and a patch marker so CSV provenance is unambiguous.
+			static const StringName required_export_monitors[] = {
+				SNAME("dumbai/export_patch_v2"),
+				SNAME("time/process_main_loop"),
+				SNAME("time/process_message_queue"),
+				SNAME("time/process_navigation_idle"),
+				SNAME("time/process_render_sync"),
+				SNAME("time/process_render_draw"),
+			};
+			for (const StringName &required_monitor : required_export_monitors) {
+				bool found = false;
+				for (int i = 0; i < monitor_names.size(); i++) {
+					if (monitor_names[i] == required_monitor) {
+						found = true;
+						break;
+					}
+				}
+				if (!found) {
+					monitor_names.push_back(required_monitor);
+				}
+			}
+
 			Vector<String> line;
-			line.resize(Performance::MONITOR_MAX);
+			line.resize(monitor_names.size());
 
 			// signatures
-			for (int i = 0; i < Performance::MONITOR_MAX; i++) {
-				line.write[i] = Performance::get_singleton()->get_monitor_name(Performance::Monitor(i));
+			for (int i = 0; i < monitor_names.size(); i++) {
+				line.write[i] = monitor_names[i];
 			}
 			file->store_csv_line(line);
 
 			// values
 			Vector<List<float>::Element *> iterators;
-			iterators.resize(Performance::MONITOR_MAX);
+			iterators.resize(monitor_names.size());
 			bool continue_iteration = false;
-			for (int i = 0; i < Performance::MONITOR_MAX; i++) {
-				iterators.write[i] = performance_profiler->get_monitor_data(Performance::get_singleton()->get_monitor_name(Performance::Monitor(i)))->back();
+			for (int i = 0; i < monitor_names.size(); i++) {
+				if (monitor_names[i] == SNAME("dumbai/export_patch_v2")) {
+					// DUMBAI: Keep this marker synthetic so patch presence can be validated without relying on runtime monitor data.
+					iterators.write[i] = nullptr;
+					continue;
+				}
+				List<float> *monitor_history = performance_profiler->get_monitor_data(monitor_names[i]);
+				// DUMBAI: Write an empty column when a monitor is missing in history instead of dropping it from the CSV schema.
+				iterators.write[i] = monitor_history ? monitor_history->back() : nullptr;
 				continue_iteration = continue_iteration || iterators[i];
 			}
 			while (continue_iteration) {
 				continue_iteration = false;
-				for (int i = 0; i < Performance::MONITOR_MAX; i++) {
+				for (int i = 0; i < monitor_names.size(); i++) {
 					if (iterators[i]) {
 						line.write[i] = String::num_real(iterators[i]->get());
 						iterators.write[i] = iterators[i]->prev();
+					} else if (monitor_names[i] == SNAME("dumbai/export_patch_v2")) {
+						line.write[i] = "2";
 					} else {
 						line.write[i] = "";
 					}

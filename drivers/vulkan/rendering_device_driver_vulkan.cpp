@@ -1831,6 +1831,29 @@ void RenderingDeviceDriverVulkan::_set_object_name(VkObjectType p_object_type, u
 Error RenderingDeviceDriverVulkan::initialize(uint32_t p_device_index, uint32_t p_frame_count) {
 	context_device = context_driver->device_get(p_device_index);
 	physical_device = context_driver->physical_device_get(p_device_index);
+	vkGetPhysicalDeviceProperties(physical_device, &physical_device_properties);
+	// DUMBAI: Reset Vulkan timestamp capability cache before queue creation so each device reinit recomputes whether GPU stage export can be enabled.
+	main_queue_family_index = UINT32_MAX;
+	main_queue_timestamp_valid_bits = 0;
+	main_queue_supports_timestamps = false;
+
+	// Workaround a driver bug on Adreno 730 GPUs that keeps leaking memory on each call to vkResetDescriptorPool.
+	// Which eventually run out of memory. In such case we should not be using linear allocated pools
+	// Bug introduced in driver 512.597.0 and fixed in 512.671.0.
+	// Confirmed by Qualcomm.
+	if (linear_descriptor_pools_enabled) {
+		const uint32_t reset_descriptor_pool_broken_driver_begin = VK_MAKE_VERSION(512u, 597u, 0u);
+		const uint32_t reset_descriptor_pool_fixed_driver_begin = VK_MAKE_VERSION(512u, 671u, 0u);
+		linear_descriptor_pools_enabled = physical_device_properties.driverVersion < reset_descriptor_pool_broken_driver_begin || physical_device_properties.driverVersion > reset_descriptor_pool_fixed_driver_begin;
+	}
+
+	// Workaround a driver bug on Adreno 5XX GPUs that causes a crash when
+	// there are empty descriptor set layouts placed between non-empty ones.
+	adreno_5xx_empty_descriptor_set_layout_workaround =
+			physical_device_properties.vendorID == RenderingContextDriver::Vendor::VENDOR_QUALCOMM &&
+			physical_device_properties.deviceID >= 0x5000000 &&
+			physical_device_properties.deviceID < 0x6000000;
+
 	frame_count = p_frame_count;
 
 	// Copy the queue family properties the context already retrieved.
@@ -1838,6 +1861,17 @@ Error RenderingDeviceDriverVulkan::initialize(uint32_t p_device_index, uint32_t 
 	queue_family_properties.resize(queue_family_count);
 	for (uint32_t i = 0; i < queue_family_count; i++) {
 		queue_family_properties[i] = context_driver->queue_family_get(p_device_index, i);
+	}
+	// DUMBAI: Print queue timestamp capabilities so benchmark logs can prove whether Vulkan timestamp queries are actually supported.
+	print_verbose(vformat("VULKAN: Timestamp period(ns)=%.6f", physical_device_properties.limits.timestampPeriod));
+	for (uint32_t i = 0; i < queue_family_properties.size(); i++) {
+		const VkQueueFamilyProperties &queue_family = queue_family_properties[i];
+		print_verbose(vformat(
+				"VULKAN: Queue family #%d flags=0x%X queue_count=%u timestamp_valid_bits=%u",
+				i,
+				uint32_t(queue_family.queueFlags),
+				queue_family.queueCount,
+				queue_family.timestampValidBits));
 	}
 
 	Error err = _initialize_device_extensions();
@@ -3174,6 +3208,20 @@ RDD::CommandQueueID RenderingDeviceDriverVulkan::command_queue_create(CommandQue
 	command_queue->queue_family = family_index;
 	command_queue->queue_index = picked_queue_index;
 	queue_family[picked_queue_index].virtual_count++;
+	if (p_identify_as_main_queue) {
+		main_queue_family_index = family_index;
+		main_queue_timestamp_valid_bits = queue_family_properties[family_index].timestampValidBits;
+		main_queue_supports_timestamps = main_queue_timestamp_valid_bits > 0;
+		// DUMBAI: Emit the selected main queue timestamp bits to validate whether render GPU profile zeros are expected on this backend.
+		print_verbose(vformat(
+				"VULKAN: Main queue family=%u queue=%u timestamp_valid_bits=%u",
+				family_index,
+				picked_queue_index,
+				queue_family_properties[family_index].timestampValidBits));
+		if (!main_queue_supports_timestamps) {
+			WARN_PRINT_ONCE("VULKAN: Main queue reports timestampValidBits=0; GPU stage timings cannot be exported on this backend/device.");
+		}
+	}
 
 	// If is was identified as the main queue and a hook is active, indicate it as such to the hook.
 	if (p_identify_as_main_queue && (VulkanHooks::get_singleton() != nullptr)) {
@@ -3528,6 +3576,9 @@ bool RenderingDeviceDriverVulkan::_determine_swap_chain_format(RenderingContextD
 
 	// Retrieve the formats supported by the surface.
 	uint32_t format_count = 0;
+	VkResult err = functions.GetPhysicalDeviceSurfaceFormatsKHR(physical_device, surface->vk_surface, &format_count, nullptr);
+	ERR_FAIL_COND_V(err != VK_SUCCESS, false);
+
 	TightLocalVector<VkSurfaceFormatKHR> formats;
 	// Loop until we get the full format list. This shouldn't have to loop more than twice on most systems.
 	while (true) {
@@ -3543,6 +3594,8 @@ bool RenderingDeviceDriverVulkan::_determine_swap_chain_format(RenderingContextD
 		ERR_FAIL_COND_V_MSG(err != VK_INCOMPLETE, false, vformat("Couldn't retrieve Vulkan surface formats (VkResult error %d).", err));
 	}
 	formats.resize(format_count);
+	err = functions.GetPhysicalDeviceSurfaceFormatsKHR(physical_device, surface->vk_surface, &format_count, formats.ptr());
+	ERR_FAIL_COND_V(err != VK_SUCCESS, false);
 
 	// If the format list includes just one entry of VK_FORMAT_UNDEFINED, the surface has no preferred format.
 	if (format_count == 1 && formats[0].format == VK_FORMAT_UNDEFINED) {
@@ -6751,25 +6804,76 @@ RDD::PipelineID RenderingDeviceDriverVulkan::compute_pipeline_create(ShaderID p_
 // ----- TIMESTAMP -----
 
 RDD::QueryPoolID RenderingDeviceDriverVulkan::timestamp_query_pool_create(uint32_t p_query_count) {
+	ERR_FAIL_COND_V(p_query_count == 0, RDD::QueryPoolID());
+	// DUMBAI: Vulkan timestamp queries are only valid on queue families with non-zero timestampValidBits.
+	if (!main_queue_supports_timestamps) {
+		WARN_PRINT_ONCE("VULKAN: Skipping timestamp query pool creation because the selected main queue does not support timestamps.");
+		return RDD::QueryPoolID();
+	}
+	if (unlikely(physical_device_properties.limits.timestampPeriod <= 0.0)) {
+		WARN_PRINT_ONCE("VULKAN: Skipping timestamp query pool creation because timestampPeriod is 0.");
+		return RDD::QueryPoolID();
+	}
+
 	VkQueryPoolCreateInfo query_pool_create_info = {};
 	query_pool_create_info.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
 	query_pool_create_info.queryType = VK_QUERY_TYPE_TIMESTAMP;
 	query_pool_create_info.queryCount = p_query_count;
 
 	VkQueryPool vk_query_pool = VK_NULL_HANDLE;
-	vkCreateQueryPool(vk_device, &query_pool_create_info, VKC::get_allocation_callbacks(VK_OBJECT_TYPE_QUERY_POOL), &vk_query_pool);
+	const VkResult err = vkCreateQueryPool(vk_device, &query_pool_create_info, VKC::get_allocation_callbacks(VK_OBJECT_TYPE_QUERY_POOL), &vk_query_pool);
+	if (unlikely(err != VK_SUCCESS || vk_query_pool == VK_NULL_HANDLE)) {
+		WARN_PRINT_ONCE(vformat("VULKAN: Failed creating timestamp query pool (err=%d). GPU stage timings will be unavailable.", int(err)));
+		return RDD::QueryPoolID();
+	}
 	return RDD::QueryPoolID(vk_query_pool);
 }
 
 void RenderingDeviceDriverVulkan::timestamp_query_pool_free(QueryPoolID p_pool_id) {
+	if (p_pool_id.id == 0) {
+		return;
+	}
 	vkDestroyQueryPool(vk_device, (VkQueryPool)p_pool_id.id, VKC::get_allocation_callbacks(VK_OBJECT_TYPE_QUERY_POOL));
 }
 
 void RenderingDeviceDriverVulkan::timestamp_query_pool_get_results(QueryPoolID p_pool_id, uint32_t p_query_count, uint64_t *r_results) {
-	vkGetQueryPoolResults(vk_device, (VkQueryPool)p_pool_id.id, 0, p_query_count, sizeof(uint64_t) * p_query_count, r_results, sizeof(uint64_t), VK_QUERY_RESULT_64_BIT);
+	if (p_query_count == 0) {
+		return;
+	}
+	if (p_pool_id.id == 0) {
+		// DUMBAI: Return deterministic zeros when timestamp queries are disabled so CSV schema remains stable across backends.
+		for (uint32_t i = 0; i < p_query_count; i++) {
+			r_results[i] = 0;
+		}
+		return;
+	}
+
+	// DUMBAI: Wait for query availability so benchmark captures deterministic GPU timestamps instead of transient zero/undefined values.
+	const VkResult result = vkGetQueryPoolResults(
+			vk_device,
+			(VkQueryPool)p_pool_id.id,
+			0,
+			p_query_count,
+			sizeof(uint64_t) * p_query_count,
+			r_results,
+			sizeof(uint64_t),
+			VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+	if (unlikely(result != VK_SUCCESS)) {
+		// DUMBAI: Keep telemetry path stable on driver quirks by returning zeros when timestamp query fetch fails.
+		for (uint32_t i = 0; i < p_query_count; i++) {
+			r_results[i] = 0;
+		}
+		WARN_PRINT_ONCE(vformat("VULKAN: vkGetQueryPoolResults for timestamps failed with err=%d. Returning zeros.", int(result)));
+	}
 }
 
 uint64_t RenderingDeviceDriverVulkan::timestamp_query_result_to_time(uint64_t p_result) {
+	const double timestamp_period = physical_device_properties.limits.timestampPeriod;
+	if (unlikely(timestamp_period <= 0.0)) {
+		// DUMBAI: Fallback to raw timestamp ticks if driver reports invalid timestampPeriod to avoid hard-zero GPU telemetry.
+		return p_result;
+	}
+
 	// This sucks because timestampPeriod multiplier is a float, while the timestamp is 64 bits nanosecs.
 	// So, in cases like nvidia which give you enormous numbers and 1 as multiplier, multiplying is next to impossible.
 	// Need to do 128 bits fixed point multiplication to get the right value.
@@ -6804,11 +6908,17 @@ uint64_t RenderingDeviceDriverVulkan::timestamp_query_result_to_time(uint64_t p_
 }
 
 void RenderingDeviceDriverVulkan::command_timestamp_query_pool_reset(CommandBufferID p_cmd_buffer, QueryPoolID p_pool_id, uint32_t p_query_count) {
+	if (p_pool_id.id == 0 || p_query_count == 0) {
+		return;
+	}
 	const CommandBufferInfo *command_buffer = (const CommandBufferInfo *)p_cmd_buffer.id;
 	vkCmdResetQueryPool(command_buffer->vk_command_buffer, (VkQueryPool)p_pool_id.id, 0, p_query_count);
 }
 
 void RenderingDeviceDriverVulkan::command_timestamp_write(CommandBufferID p_cmd_buffer, QueryPoolID p_pool_id, uint32_t p_index) {
+	if (p_pool_id.id == 0) {
+		return;
+	}
 	const CommandBufferInfo *command_buffer = (const CommandBufferInfo *)p_cmd_buffer.id;
 	vkCmdWriteTimestamp(command_buffer->vk_command_buffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, (VkQueryPool)p_pool_id.id, p_index);
 }

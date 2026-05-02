@@ -4808,6 +4808,12 @@ bool Main::is_iterating() {
 static uint64_t physics_process_max = 0;
 static uint64_t process_max = 0;
 static uint64_t navigation_process_max = 0;
+// DUMBAI: Keep separate maxima for idle-frame process sub-stages so monitor export pinpoints real process bottleneck.
+static uint64_t process_main_loop_max = 0;
+static uint64_t process_message_queue_max = 0;
+static uint64_t process_navigation_idle_max = 0;
+static uint64_t process_render_sync_max = 0;
+static uint64_t process_render_draw_max = 0;
 
 // Return false means iterating further, returning true means `OS::run`
 // will terminate the program. In case of failure, the OS exit code needs
@@ -4952,24 +4958,35 @@ bool Main::iteration() {
 
 	uint64_t process_begin = OS::get_singleton()->get_ticks_usec();
 
+	uint64_t process_main_loop_begin = OS::get_singleton()->get_ticks_usec();
 	GodotProfileZoneGrouped(_profile_zone, "process");
-	if (OS::get_singleton()->get_main_loop()->process(process_step * time_scale)) {
+	// DUMBAI: Reuse precomputed scaled_step to avoid duplicate multiplications in the hot idle loop.
+	if (OS::get_singleton()->get_main_loop()->process(scaled_step)) {
 		exit = true;
 	}
-	message_queue->flush();
+	process_main_loop_max = MAX(OS::get_singleton()->get_ticks_usec() - process_main_loop_begin, process_main_loop_max);
 
+	uint64_t process_message_queue_begin = OS::get_singleton()->get_ticks_usec();
+	message_queue->flush();
+	process_message_queue_max = MAX(OS::get_singleton()->get_ticks_usec() - process_message_queue_begin, process_message_queue_max);
+
+	uint64_t process_navigation_idle_begin = OS::get_singleton()->get_ticks_usec();
 #ifndef NAVIGATION_2D_DISABLED
 	GodotProfileZoneGrouped(_profile_zone, "process 2D navigation");
-	NavigationServer2D::get_singleton()->process(process_step * time_scale);
+	NavigationServer2D::get_singleton()->process(scaled_step);
 #endif // NAVIGATION_2D_DISABLED
 #ifndef NAVIGATION_3D_DISABLED
 	GodotProfileZoneGrouped(_profile_zone, "process 3D navigation");
-	NavigationServer3D::get_singleton()->process(process_step * time_scale);
+	NavigationServer3D::get_singleton()->process(scaled_step);
 #endif // NAVIGATION_3D_DISABLED
+	process_navigation_idle_max = MAX(OS::get_singleton()->get_ticks_usec() - process_navigation_idle_begin, process_navigation_idle_max);
 
+	uint64_t process_render_sync_begin = OS::get_singleton()->get_ticks_usec();
 	GodotProfileZoneGrouped(_profile_zone, "RenderingServer::sync");
 	RenderingServer::get_singleton()->sync(); //sync if still drawing from previous frames.
+	process_render_sync_max = MAX(OS::get_singleton()->get_ticks_usec() - process_render_sync_begin, process_render_sync_max);
 
+	uint64_t process_render_draw_begin = OS::get_singleton()->get_ticks_usec();
 	GodotProfileZoneGrouped(_profile_zone, "RenderingServer::draw");
 	const bool has_pending_resources_for_processing = RD::get_singleton() && RD::get_singleton()->has_pending_resources_for_processing();
 	bool wants_present = (DisplayServer::get_singleton()->can_any_window_draw() ||
@@ -4989,6 +5006,7 @@ bool Main::iteration() {
 			force_redraw_requested = false;
 		}
 	}
+	process_render_draw_max = MAX(OS::get_singleton()->get_ticks_usec() - process_render_draw_begin, process_render_draw_max);
 
 	process_ticks = OS::get_singleton()->get_ticks_usec() - process_begin;
 	process_max = MAX(process_ticks, process_max);
@@ -5030,9 +5048,19 @@ bool Main::iteration() {
 		performance->set_process_time(USEC_TO_SEC(process_max));
 		performance->set_physics_process_time(USEC_TO_SEC(physics_process_max));
 		performance->set_navigation_process_time(USEC_TO_SEC(navigation_process_max));
+		performance->set_process_main_loop_time(USEC_TO_SEC(process_main_loop_max));
+		performance->set_process_message_queue_time(USEC_TO_SEC(process_message_queue_max));
+		performance->set_process_navigation_idle_time(USEC_TO_SEC(process_navigation_idle_max));
+		performance->set_process_render_sync_time(USEC_TO_SEC(process_render_sync_max));
+		performance->set_process_render_draw_time(USEC_TO_SEC(process_render_draw_max));
 		process_max = 0;
 		physics_process_max = 0;
 		navigation_process_max = 0;
+		process_main_loop_max = 0;
+		process_message_queue_max = 0;
+		process_navigation_idle_max = 0;
+		process_render_sync_max = 0;
+		process_render_draw_max = 0;
 
 		frame %= 1000000;
 		frames = 0;

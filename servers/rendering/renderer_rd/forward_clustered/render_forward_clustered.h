@@ -30,7 +30,9 @@
 
 #pragma once
 
+#include "core/os/mutex.h"
 #include "core/templates/paged_allocator.h"
+#include "core/variant/dictionary.h"
 #include "servers/rendering/multi_uma_buffer.h"
 #include "servers/rendering/renderer_rd/cluster_builder_rd.h"
 #include "servers/rendering/renderer_rd/effects/fsr2.h"
@@ -445,6 +447,108 @@ private:
 		void grow_instance_buffer(RenderListType p_render_list, uint32_t p_req_element_count, bool p_append);
 	} scene_state;
 
+	// DUMBAI: Keep a per-frame forward-clustered workload snapshot so benchmarks can correlate GPU stage cost with concrete scene pass load.
+	struct BenchmarkWorkloadSnapshot {
+		uint64_t opaque_elements = 0;
+		uint64_t transparent_elements = 0;
+		uint64_t motion_elements = 0;
+		uint64_t total_visible_elements = 0;
+		uint64_t opaque_draw_calls = 0;
+		uint64_t transparent_draw_calls = 0;
+		uint64_t motion_draw_calls = 0;
+		uint64_t depth_prepass_policy = 0;
+		uint64_t depth_prepass_draw_calls = 0;
+		uint64_t opaque_primitives = 0;
+		uint64_t transparent_primitives = 0;
+		uint64_t motion_primitives = 0;
+		uint64_t depth_prepass_primitives = 0;
+		uint64_t shadow_directional_passes = 0;
+		uint64_t shadow_positional_passes = 0;
+		uint64_t shadow_omni_cube_passes = 0;
+		uint64_t shadow_directional_instances = 0;
+		uint64_t shadow_positional_instances = 0;
+		uint64_t shadow_omni_cube_instances = 0;
+		uint64_t shadow_directional_draw_calls = 0;
+		uint64_t shadow_positional_draw_calls = 0;
+		uint64_t shadow_omni_cube_draw_calls = 0;
+		uint64_t shadow_directional_primitives = 0;
+		uint64_t shadow_positional_primitives = 0;
+		uint64_t shadow_omni_cube_primitives = 0;
+		uint64_t render_shadow_count = 0;
+		uint64_t cluster_max_elements = 0;
+		uint64_t view_count = 0;
+		uint64_t directional_light_count = 0;
+		uint64_t positional_light_count = 0;
+		uint64_t sdfgi_frame_index = 0;
+		uint64_t sdfgi_update_interval_frames = 1;
+		uint64_t sdfgi_regions_requested = 0;
+		uint64_t sdfgi_regions_rendered = 0;
+		uint64_t sdfgi_static_cascades_requested = 0;
+		uint64_t sdfgi_static_cascades_rendered = 0;
+		uint64_t sdfgi_static_lights_requested = 0;
+		uint64_t sdfgi_static_lights_rendered = 0;
+		uint64_t sdfgi_update_cascades_calls = 0;
+		uint64_t sdfgi_pre_process_calls = 0;
+		uint64_t sdfgi_update_light_calls = 0;
+		double sdfgi_region_render_cpu_ms = 0.0;
+		double sdfgi_static_light_cpu_ms = 0.0;
+		double sdfgi_update_cascades_cpu_ms = 0.0;
+		double sdfgi_pre_process_cpu_ms = 0.0;
+		double sdfgi_update_light_cpu_ms = 0.0;
+		double sdfgi_total_cpu_ms = 0.0;
+		bool using_sdfgi = false;
+		bool using_voxelgi = false;
+		bool using_ssr = false;
+		bool using_ssil = false;
+		bool using_motion_pass = false;
+		bool rendering_reflection_probe = false;
+		bool depth_prepass_enabled = false;
+		bool depth_prepass_forced_by_stencil = false;
+		bool depth_prepass_requested_by_setting = false;
+		bool depth_prepass_has_framebuffer = false;
+		bool depth_prepass_finish_depth = false;
+		bool depth_prepass_reason_ssao = false;
+		bool depth_prepass_reason_ssil = false;
+		bool depth_prepass_reason_sdfgi = false;
+		bool depth_prepass_reason_voxelgi = false;
+		bool depth_prepass_reason_ce_pre_opaque_resolved_depth = false;
+		bool depth_prepass_reason_ce_post_opaque_resolved_depth = false;
+		bool sdfgi_budget_throttled = false;
+		bool sdfgi_update_executed = false;
+		bool sdfgi_update_skipped = false;
+	};
+	mutable Mutex benchmark_workload_snapshot_mutex;
+	BenchmarkWorkloadSnapshot benchmark_workload_snapshot;
+
+	// DUMBAI: Track per-frame SDFGI update work so BENCH logs can separate geometry pass cost from GI update cost.
+	struct SDFGIBenchmarkFrameMetrics {
+		uint64_t frame_index = 0;
+		uint64_t update_interval_frames = 1;
+		uint64_t regions_requested = 0;
+		uint64_t regions_rendered = 0;
+		uint64_t static_cascades_requested = 0;
+		uint64_t static_cascades_rendered = 0;
+		uint64_t static_lights_requested = 0;
+		uint64_t static_lights_rendered = 0;
+		uint64_t update_cascades_calls = 0;
+		uint64_t pre_process_calls = 0;
+		uint64_t update_light_calls = 0;
+		double region_render_cpu_ms = 0.0;
+		double static_light_cpu_ms = 0.0;
+		double update_cascades_cpu_ms = 0.0;
+		double pre_process_cpu_ms = 0.0;
+		double update_light_cpu_ms = 0.0;
+		double total_cpu_ms = 0.0;
+		bool budget_throttled = false;
+		bool update_executed = false;
+		bool update_skipped = false;
+	};
+	uint64_t sdfgi_benchmark_frame_counter = 0;
+	SDFGIBenchmarkFrameMetrics sdfgi_benchmark_metrics;
+	uint32_t _get_sdfgi_benchmark_update_interval_frames() const;
+	int _get_sdfgi_benchmark_max_regions_per_frame() const;
+	bool _should_run_sdfgi_benchmark_update(uint32_t p_update_interval_frames, uint64_t p_frame_index) const;
+
 	static RenderForwardClustered *singleton;
 
 	uint32_t _setup_environment(const RenderDataRD *p_render_data, bool p_no_fog, const Size2i &p_screen_size, const Size2 &p_viewport_size, const Color &p_default_bg_color, bool p_opaque_render_buffers = false, bool p_apply_alpha_multiplier = false, bool p_pancake_shadows = false);
@@ -474,8 +578,8 @@ private:
 	void _render_list(RenderingDevice::DrawListID p_draw_list, RenderingDevice::FramebufferFormatID p_framebuffer_Format, RenderListParameters *p_params, uint32_t p_from_element, uint32_t p_to_element);
 	void _render_list_with_draw_list(RenderListParameters *p_params, RID p_framebuffer, BitField<RD::DrawFlags> p_draw_flags = RD::DRAW_DEFAULT_ALL, const Vector<Color> &p_clear_color_values = Vector<Color>(), float p_clear_depth_value = 0.0, uint32_t p_clear_stencil_value = 0, const Rect2 &p_region = Rect2());
 
-	void _fill_instance_data(RenderListType p_render_list, int *p_render_info = nullptr, uint32_t p_offset = 0, int32_t p_max_elements = -1, bool p_update_buffer = true);
-	void _fill_render_list(RenderListType p_render_list, const RenderDataRD *p_render_data, PassMode p_pass_mode, bool p_using_sdfgi = false, bool p_using_opaque_gi = false, bool p_using_motion_pass = false, bool p_append = false);
+	void _fill_instance_data(RenderListType p_render_list, int *p_render_info = nullptr, uint32_t p_offset = 0, int32_t p_max_elements = -1, bool p_update_buffer = true, uint64_t *r_draw_call_count = nullptr);
+	void _fill_render_list(RenderListType p_render_list, const RenderDataRD *p_render_data, PassMode p_pass_mode, bool p_using_sdfgi = false, bool p_using_opaque_gi = false, bool p_using_motion_pass = false, bool p_append = false, uint64_t *r_opaque_primitives = nullptr, uint64_t *r_alpha_primitives = nullptr, uint64_t *r_motion_primitives = nullptr, uint64_t *r_shadow_primitives = nullptr);
 
 	HashMap<Size2i, RID> sdfgi_framebuffer_size_cache;
 
@@ -809,6 +913,8 @@ protected:
 
 public:
 	static RenderForwardClustered *get_singleton() { return singleton; }
+	// DUMBAI: Expose the latest frame workload snapshot so scripts can log pass load next to profiler timings.
+	Dictionary get_benchmark_workload_snapshot() const;
 
 	ClusterBuilderSharedDataRD *get_cluster_builder_shared() { return &cluster_builder_shared; }
 	RendererRD::SSEffects *get_ss_effects() { return ss_effects; }

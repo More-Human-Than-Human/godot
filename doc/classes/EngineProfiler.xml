@@ -27,6 +27,13 @@
 				Called once every engine iteration when the profiler is active with information about the current frame. All time values are in seconds. Lower values represent faster processing times and are therefore considered better.
 			</description>
 		</method>
+		<method name="_update" qualifiers="virtual">
+			<return type="void" />
+			<param index="0" name="metrics" type="Dictionary" />
+			<description>
+				Called once every engine iteration when the profiler is active with a richer frame metrics payload. The [param metrics] dictionary includes the basic timing values ([code]frame_time[/code], [code]process_time[/code], [code]physics_time[/code], [code]physics_frame_time[/code]) and additional engine state such as [code]fps[/code], [code]process_frames[/code], [code]physics_frames[/code], plus nested [code]process_breakdown[/code] and [code]render_profile[/code] dictionaries.
+			</description>
+		</method>
 		<method name="_toggle" qualifiers="virtual">
 			<return type="void" />
 			<param index="0" name="enable" type="bool" />

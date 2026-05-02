@@ -40,6 +40,10 @@
 #include "servers/audio/audio_server.h"
 #include "servers/rendering/rendering_server.h"
 
+#ifndef _3D_DISABLED
+#include "servers/rendering/renderer_rd/forward_clustered/render_forward_clustered.h"
+#endif // _3D_DISABLED
+
 #ifndef NAVIGATION_2D_DISABLED
 #include "servers/navigation_2d/navigation_server_2d.h"
 #endif // NAVIGATION_2D_DISABLED
@@ -67,6 +71,9 @@ void Performance::_bind_methods() {
 	ClassDB::bind_method(D_METHOD("get_monitor_modification_time"), &Performance::get_monitor_modification_time);
 	ClassDB::bind_method(D_METHOD("get_custom_monitor_names"), &Performance::get_custom_monitor_names);
 	ClassDB::bind_method(D_METHOD("get_custom_monitor_types"), &Performance::get_custom_monitor_types);
+	ClassDB::bind_method(D_METHOD("get_render_profile_stage_breakdown", "limit", "sort_by_gpu_total"), &Performance::get_render_profile_stage_breakdown, DEFVAL(8), DEFVAL(true));
+	// DUMBAI: Bind workload snapshot accessor so GDScript benchmark runners can log pass-level pressure without adding renderer-specific script hacks.
+	ClassDB::bind_method(D_METHOD("get_render_forward_clustered_workload_snapshot"), &Performance::get_render_forward_clustered_workload_snapshot);
 
 	BIND_ENUM_CONSTANT(TIME_FPS);
 	BIND_ENUM_CONSTANT(TIME_PROCESS);
@@ -135,6 +142,37 @@ void Performance::_bind_methods() {
 	BIND_ENUM_CONSTANT(NAVIGATION_3D_EDGE_FREE_COUNT);
 	BIND_ENUM_CONSTANT(NAVIGATION_3D_OBSTACLE_COUNT);
 #endif // NAVIGATION_3D_DISABLED
+	// DUMBAI: Expose idle-frame process sub-stage metrics to isolate whether script, queue, navigation, sync, or draw dominates.
+	BIND_ENUM_CONSTANT(TIME_PROCESS_MAIN_LOOP);
+	BIND_ENUM_CONSTANT(TIME_PROCESS_MESSAGE_QUEUE);
+	BIND_ENUM_CONSTANT(TIME_PROCESS_NAVIGATION_IDLE);
+	BIND_ENUM_CONSTANT(TIME_PROCESS_RENDER_SYNC);
+	BIND_ENUM_CONSTANT(TIME_PROCESS_RENDER_DRAW);
+	// DUMBAI: Expose SceneTree::process sub-stages so benchmark exports can attribute _process cost to concrete engine phases.
+	BIND_ENUM_CONSTANT(TIME_PROCESS_SCENE_TREE_FTI);
+	BIND_ENUM_CONSTANT(TIME_PROCESS_SCENE_TREE_MAIN_LOOP);
+	BIND_ENUM_CONSTANT(TIME_PROCESS_SCENE_TREE_MULTIPLAYER);
+	BIND_ENUM_CONSTANT(TIME_PROCESS_SCENE_TREE_SIGNAL);
+	BIND_ENUM_CONSTANT(TIME_PROCESS_SCENE_TREE_MESSAGE_QUEUE);
+	BIND_ENUM_CONSTANT(TIME_PROCESS_SCENE_TREE_TRANSFORM_FLUSH);
+	BIND_ENUM_CONSTANT(TIME_PROCESS_SCENE_TREE_GROUPS);
+	BIND_ENUM_CONSTANT(TIME_PROCESS_SCENE_TREE_UGC);
+	BIND_ENUM_CONSTANT(TIME_PROCESS_SCENE_TREE_SCENE_CHANGE);
+	BIND_ENUM_CONSTANT(TIME_PROCESS_SCENE_TREE_TIMERS);
+	BIND_ENUM_CONSTANT(TIME_PROCESS_SCENE_TREE_TWEENS);
+	BIND_ENUM_CONSTANT(TIME_PROCESS_SCENE_TREE_DELETE_QUEUE);
+	BIND_ENUM_CONSTANT(TIME_PROCESS_SCENE_TREE_ACCESSIBILITY);
+	BIND_ENUM_CONSTANT(TIME_PROCESS_SCENE_TREE_IDLE_CALLBACKS);
+	BIND_ENUM_CONSTANT(TIME_PROCESS_SCENE_TREE_OTHER);
+	// DUMBAI: Expose renderer frame-profile CPU/GPU timings for spike attribution against the 16.67ms target budget.
+	BIND_ENUM_CONSTANT(TIME_RENDER_FRAME_SETUP_CPU);
+	BIND_ENUM_CONSTANT(TIME_RENDER_PROFILE_CPU_TOTAL);
+	BIND_ENUM_CONSTANT(TIME_RENDER_PROFILE_GPU_TOTAL);
+	BIND_ENUM_CONSTANT(TIME_RENDER_PROFILE_CPU_MAX_STAGE);
+	BIND_ENUM_CONSTANT(TIME_RENDER_PROFILE_GPU_MAX_STAGE);
+	BIND_ENUM_CONSTANT(TIME_RENDER_PROFILE_STAGE_COUNT);
+	BIND_ENUM_CONSTANT(TIME_RENDER_PROFILE_GPU_NONZERO_STAGE_COUNT);
+	BIND_ENUM_CONSTANT(TIME_RENDER_PROFILE_GPU_ZERO_STAGE_COUNT);
 	BIND_ENUM_CONSTANT(MONITOR_MAX);
 
 	BIND_ENUM_CONSTANT(MONITOR_TYPE_QUANTITY);
@@ -230,6 +268,35 @@ String Performance::get_monitor_name(Monitor p_monitor) const {
 		PNAME("navigation_3d/edges_free"),
 		PNAME("navigation_3d/obstacles"),
 #endif // NAVIGATION_3D_DISABLED
+		PNAME("time/process_main_loop"),
+		PNAME("time/process_message_queue"),
+		PNAME("time/process_navigation_idle"),
+		PNAME("time/process_render_sync"),
+		PNAME("time/process_render_draw"),
+		// DUMBAI: Keep monitor names flat for CSV exports and scripted lookups in benchmark automation.
+		PNAME("time/process_scene_tree_fti"),
+		PNAME("time/process_scene_tree_main_loop"),
+		PNAME("time/process_scene_tree_multiplayer"),
+		PNAME("time/process_scene_tree_signal"),
+		PNAME("time/process_scene_tree_message_queue"),
+		PNAME("time/process_scene_tree_transform_flush"),
+		PNAME("time/process_scene_tree_groups"),
+		PNAME("time/process_scene_tree_ugc"),
+		PNAME("time/process_scene_tree_scene_change"),
+		PNAME("time/process_scene_tree_timers"),
+		PNAME("time/process_scene_tree_tweens"),
+		PNAME("time/process_scene_tree_delete_queue"),
+		PNAME("time/process_scene_tree_accessibility"),
+		PNAME("time/process_scene_tree_idle_callbacks"),
+		PNAME("time/process_scene_tree_other"),
+		PNAME("time/render_frame_setup_cpu"),
+		PNAME("time/render_profile_cpu_total"),
+		PNAME("time/render_profile_gpu_total"),
+		PNAME("time/render_profile_cpu_max_stage"),
+		PNAME("time/render_profile_gpu_max_stage"),
+		PNAME("time/render_profile_stage_count"),
+		PNAME("time/render_profile_gpu_nonzero_stage_count"),
+		PNAME("time/render_profile_gpu_zero_stage_count"),
 	};
 	static_assert(std_size(names) == MONITOR_MAX);
 
@@ -248,6 +315,70 @@ double Performance::get_monitor(Monitor p_monitor) const {
 			return _physics_process_time;
 		case TIME_NAVIGATION_PROCESS:
 			return _navigation_process_time;
+		case TIME_PROCESS_MAIN_LOOP:
+			return _process_main_loop_time;
+		case TIME_PROCESS_MESSAGE_QUEUE:
+			return _process_message_queue_time;
+		case TIME_PROCESS_NAVIGATION_IDLE:
+			return _process_navigation_idle_time;
+		case TIME_PROCESS_RENDER_SYNC:
+			return _process_render_sync_time;
+		case TIME_PROCESS_RENDER_DRAW:
+			return _process_render_draw_time;
+		// DUMBAI: Surface SceneTree idle-frame sub-stage durations as first-class monitors for automated bottleneck triage.
+		case TIME_PROCESS_SCENE_TREE_FTI:
+			return _process_scene_tree_fti_time;
+		case TIME_PROCESS_SCENE_TREE_MAIN_LOOP:
+			return _process_scene_tree_main_loop_time;
+		case TIME_PROCESS_SCENE_TREE_MULTIPLAYER:
+			return _process_scene_tree_multiplayer_time;
+		case TIME_PROCESS_SCENE_TREE_SIGNAL:
+			return _process_scene_tree_signal_time;
+		case TIME_PROCESS_SCENE_TREE_MESSAGE_QUEUE:
+			return _process_scene_tree_message_queue_time;
+		case TIME_PROCESS_SCENE_TREE_TRANSFORM_FLUSH:
+			return _process_scene_tree_transform_flush_time;
+		case TIME_PROCESS_SCENE_TREE_GROUPS:
+			return _process_scene_tree_groups_time;
+		case TIME_PROCESS_SCENE_TREE_UGC:
+			return _process_scene_tree_ugc_time;
+		case TIME_PROCESS_SCENE_TREE_SCENE_CHANGE:
+			return _process_scene_tree_scene_change_time;
+		case TIME_PROCESS_SCENE_TREE_TIMERS:
+			return _process_scene_tree_timers_time;
+		case TIME_PROCESS_SCENE_TREE_TWEENS:
+			return _process_scene_tree_tweens_time;
+		case TIME_PROCESS_SCENE_TREE_DELETE_QUEUE:
+			return _process_scene_tree_delete_queue_time;
+		case TIME_PROCESS_SCENE_TREE_ACCESSIBILITY:
+			return _process_scene_tree_accessibility_time;
+		case TIME_PROCESS_SCENE_TREE_IDLE_CALLBACKS:
+			return _process_scene_tree_idle_callbacks_time;
+		case TIME_PROCESS_SCENE_TREE_OTHER:
+			return _process_scene_tree_other_time;
+		case TIME_RENDER_FRAME_SETUP_CPU:
+			return RS::get_singleton()->get_frame_setup_time_cpu() / 1000.0;
+		case TIME_RENDER_PROFILE_CPU_TOTAL:
+			_refresh_render_profile_cache();
+			return _render_profile_cpu_total_time;
+		case TIME_RENDER_PROFILE_GPU_TOTAL:
+			_refresh_render_profile_cache();
+			return _render_profile_gpu_total_time;
+		case TIME_RENDER_PROFILE_CPU_MAX_STAGE:
+			_refresh_render_profile_cache();
+			return _render_profile_cpu_max_stage_time;
+		case TIME_RENDER_PROFILE_GPU_MAX_STAGE:
+			_refresh_render_profile_cache();
+			return _render_profile_gpu_max_stage_time;
+		case TIME_RENDER_PROFILE_STAGE_COUNT:
+			_refresh_render_profile_cache();
+			return _render_profile_stage_count;
+		case TIME_RENDER_PROFILE_GPU_NONZERO_STAGE_COUNT:
+			_refresh_render_profile_cache();
+			return _render_profile_gpu_nonzero_stage_count;
+		case TIME_RENDER_PROFILE_GPU_ZERO_STAGE_COUNT:
+			_refresh_render_profile_cache();
+			return _render_profile_gpu_zero_stage_count;
 		case MEMORY_STATIC:
 			return Memory::get_mem_usage();
 		case MEMORY_STATIC_MAX:
@@ -462,6 +593,198 @@ double Performance::get_monitor(Monitor p_monitor) const {
 	return 0;
 }
 
+void Performance::_ensure_render_profile_capture_enabled() const {
+	if (_render_profile_capture_enabled) {
+		return;
+	}
+
+	// DUMBAI: Enable renderer timestamp capture lazily so GPU profile overhead only appears when render profile monitors are queried.
+	RS::get_singleton()->set_frame_profiling_enabled(true);
+	_render_profile_capture_enabled = true;
+}
+
+void Performance::_refresh_render_profile_cache() const {
+	_ensure_render_profile_capture_enabled();
+
+	const uint64_t profile_frame = RS::get_singleton()->get_frame_profile_frame();
+	if (_render_profile_cache_valid && _render_profile_cached_frame == profile_frame) {
+		return;
+	}
+
+	_render_profile_cached_frame = profile_frame;
+	_render_profile_cache_valid = true;
+	_render_profile_cpu_total_time = 0.0;
+	_render_profile_gpu_total_time = 0.0;
+	_render_profile_cpu_max_stage_time = 0.0;
+	_render_profile_gpu_max_stage_time = 0.0;
+	_render_profile_stage_count = 0.0;
+	_render_profile_gpu_nonzero_stage_count = 0.0;
+	_render_profile_gpu_zero_stage_count = 0.0;
+
+	const Vector<RenderingServerTypes::FrameProfileArea> frame_profile = RS::get_singleton()->get_frame_profile();
+	if (frame_profile.is_empty()) {
+		return;
+	}
+
+	const RenderingServerTypes::FrameProfileArea &frame_tail = frame_profile[frame_profile.size() - 1];
+	_render_profile_cpu_total_time = frame_tail.cpu_msec / 1000.0;
+	_render_profile_gpu_total_time = frame_tail.gpu_msec / 1000.0;
+
+	for (int i = 0; i < frame_profile.size() - 1; i++) {
+		const RenderingServerTypes::FrameProfileArea &area = frame_profile[i];
+		if (area.name.is_empty()) {
+			continue;
+		}
+		// DUMBAI: Skip internal bracket markers so max-stage timing reflects real render tasks only.
+		if (area.name[0] == '<' || area.name[0] == '>') {
+			continue;
+		}
+
+		const RenderingServerTypes::FrameProfileArea &next = frame_profile[i + 1];
+		const double stage_cpu_time = MAX(0.0, next.cpu_msec - area.cpu_msec) / 1000.0;
+		const double stage_gpu_time = MAX(0.0, next.gpu_msec - area.gpu_msec) / 1000.0;
+		_render_profile_stage_count += 1.0;
+		// DUMBAI: Split non-zero vs zero GPU stage samples to expose missing timestamp support in automated CSV runs.
+		if (stage_gpu_time > 0.0) {
+			_render_profile_gpu_nonzero_stage_count += 1.0;
+		} else {
+			_render_profile_gpu_zero_stage_count += 1.0;
+		}
+		_render_profile_cpu_max_stage_time = MAX(_render_profile_cpu_max_stage_time, stage_cpu_time);
+		_render_profile_gpu_max_stage_time = MAX(_render_profile_gpu_max_stage_time, stage_gpu_time);
+	}
+}
+
+Array Performance::get_render_profile_stage_breakdown(int p_limit, bool p_sort_by_gpu_total) const {
+	_ensure_render_profile_capture_enabled();
+
+	Array breakdown;
+	const Vector<RenderingServerTypes::FrameProfileArea> frame_profile = RS::get_singleton()->get_frame_profile();
+	if (frame_profile.size() < 2) {
+		return breakdown;
+	}
+
+	struct StageTotals {
+		double cpu_total_time = 0.0;
+		double gpu_total_time = 0.0;
+		double cpu_max_time = 0.0;
+		double gpu_max_time = 0.0;
+		int sample_count = 0;
+	};
+
+	HashMap<String, StageTotals> totals_by_stage;
+	for (int i = 0; i < frame_profile.size() - 1; i++) {
+		const RenderingServerTypes::FrameProfileArea &area = frame_profile[i];
+		if (area.name.is_empty()) {
+			continue;
+		}
+		// DUMBAI: Ignore profiler bracket markers so stage ranking reflects actionable renderer work items only.
+		if (area.name[0] == '<' || area.name[0] == '>') {
+			continue;
+		}
+
+		const RenderingServerTypes::FrameProfileArea &next = frame_profile[i + 1];
+		const double stage_cpu_time = MAX(0.0, next.cpu_msec - area.cpu_msec) / 1000.0;
+		const double stage_gpu_time = MAX(0.0, next.gpu_msec - area.gpu_msec) / 1000.0;
+		const String stage_name = String(area.name);
+
+		StageTotals *existing = totals_by_stage.getptr(stage_name);
+		if (existing == nullptr) {
+			StageTotals initial;
+			initial.cpu_total_time = stage_cpu_time;
+			initial.gpu_total_time = stage_gpu_time;
+			initial.cpu_max_time = stage_cpu_time;
+			initial.gpu_max_time = stage_gpu_time;
+			initial.sample_count = 1;
+			totals_by_stage.insert(stage_name, initial);
+			continue;
+		}
+
+		existing->cpu_total_time += stage_cpu_time;
+		existing->gpu_total_time += stage_gpu_time;
+		existing->cpu_max_time = MAX(existing->cpu_max_time, stage_cpu_time);
+		existing->gpu_max_time = MAX(existing->gpu_max_time, stage_gpu_time);
+		existing->sample_count += 1;
+	}
+
+	if (totals_by_stage.is_empty()) {
+		return breakdown;
+	}
+
+	Vector<String> stage_names;
+	for (const KeyValue<String, StageTotals> &entry : totals_by_stage) {
+		stage_names.push_back(entry.key);
+	}
+
+	const int stage_limit = CLAMP(p_limit, 1, stage_names.size());
+	PackedByteArray used_indices;
+	used_indices.resize(stage_names.size());
+	uint8_t *used = used_indices.ptrw();
+	for (int i = 0; i < stage_names.size(); i++) {
+		used[i] = 0;
+	}
+
+	const RenderingServerTypes::FrameProfileArea &frame_tail = frame_profile[frame_profile.size() - 1];
+	const double frame_cpu_total_time = MAX(0.0, frame_tail.cpu_msec) / 1000.0;
+	const double frame_gpu_total_time = MAX(0.0, frame_tail.gpu_msec) / 1000.0;
+
+	for (int rank = 0; rank < stage_limit; rank++) {
+		int best_index = -1;
+		double best_score = -1.0;
+		for (int i = 0; i < stage_names.size(); i++) {
+			if (used[i] != 0) {
+				continue;
+			}
+			const StageTotals *candidate = totals_by_stage.getptr(stage_names[i]);
+			if (candidate == nullptr) {
+				continue;
+			}
+			const double score = p_sort_by_gpu_total ? candidate->gpu_total_time : candidate->cpu_total_time;
+			if (score > best_score) {
+				best_score = score;
+				best_index = i;
+			}
+		}
+
+		if (best_index < 0) {
+			break;
+		}
+		used[best_index] = 1;
+
+		const StageTotals *selected = totals_by_stage.getptr(stage_names[best_index]);
+		if (selected == nullptr) {
+			continue;
+		}
+
+		Dictionary stage_row;
+		stage_row["name"] = stage_names[best_index];
+		// DUMBAI: Export stage times in milliseconds to align directly with 16.67ms/frame optimization budgeting.
+		stage_row["cpu_ms"] = selected->cpu_total_time * 1000.0;
+		stage_row["gpu_ms"] = selected->gpu_total_time * 1000.0;
+		stage_row["cpu_max_ms"] = selected->cpu_max_time * 1000.0;
+		stage_row["gpu_max_ms"] = selected->gpu_max_time * 1000.0;
+		stage_row["sample_count"] = selected->sample_count;
+		// DUMBAI: Include frame-share ratios so top stages can be prioritized by contribution, not only absolute milliseconds.
+		stage_row["cpu_frame_share"] = frame_cpu_total_time > 0.0 ? selected->cpu_total_time / frame_cpu_total_time : 0.0;
+		stage_row["gpu_frame_share"] = frame_gpu_total_time > 0.0 ? selected->gpu_total_time / frame_gpu_total_time : 0.0;
+		breakdown.push_back(stage_row);
+	}
+
+	return breakdown;
+}
+
+Dictionary Performance::get_render_forward_clustered_workload_snapshot() const {
+#ifndef _3D_DISABLED
+	RendererSceneRenderImplementation::RenderForwardClustered *forward_clustered = RendererSceneRenderImplementation::RenderForwardClustered::get_singleton();
+	if (forward_clustered != nullptr) {
+		// DUMBAI: Forward+ snapshot gives per-pass workload counts that explain why specific GPU stages dominate in benchmark traces.
+		return forward_clustered->get_benchmark_workload_snapshot();
+	}
+#endif // _3D_DISABLED
+
+	return Dictionary();
+}
+
 Performance::MonitorType Performance::get_monitor_type(Monitor p_monitor) const {
 	ERR_FAIL_INDEX_V(p_monitor, MONITOR_MAX, MONITOR_TYPE_QUANTITY);
 	// ugly
@@ -527,7 +850,37 @@ Performance::MonitorType Performance::get_monitor_type(Monitor p_monitor) const 
 		MONITOR_TYPE_QUANTITY,
 		MONITOR_TYPE_QUANTITY,
 #endif // _3D_DISABLED
-
+		MONITOR_TYPE_TIME,
+		MONITOR_TYPE_TIME,
+		MONITOR_TYPE_TIME,
+		MONITOR_TYPE_TIME,
+		MONITOR_TYPE_TIME,
+		// DUMBAI: SceneTree::process sub-stage monitors are timing values in seconds.
+		MONITOR_TYPE_TIME,
+		MONITOR_TYPE_TIME,
+		MONITOR_TYPE_TIME,
+		MONITOR_TYPE_TIME,
+		MONITOR_TYPE_TIME,
+		MONITOR_TYPE_TIME,
+		MONITOR_TYPE_TIME,
+		MONITOR_TYPE_TIME,
+		MONITOR_TYPE_TIME,
+		MONITOR_TYPE_TIME,
+		MONITOR_TYPE_TIME,
+		MONITOR_TYPE_TIME,
+		MONITOR_TYPE_TIME,
+		MONITOR_TYPE_TIME,
+		MONITOR_TYPE_TIME,
+		// DUMBAI: Render profile/renderer setup monitors are also reported as time values (seconds).
+		MONITOR_TYPE_TIME,
+		MONITOR_TYPE_TIME,
+		MONITOR_TYPE_TIME,
+		MONITOR_TYPE_TIME,
+		MONITOR_TYPE_TIME,
+		// DUMBAI: Frame-profile sample health monitors are counts, not durations.
+		MONITOR_TYPE_QUANTITY,
+		MONITOR_TYPE_QUANTITY,
+		MONITOR_TYPE_QUANTITY,
 	};
 	static_assert((sizeof(types) / sizeof(MonitorType)) == MONITOR_MAX);
 
@@ -544,6 +897,87 @@ void Performance::set_physics_process_time(double p_pt) {
 
 void Performance::set_navigation_process_time(double p_pt) {
 	_navigation_process_time = p_pt;
+}
+
+void Performance::set_process_main_loop_time(double p_pt) {
+	_process_main_loop_time = p_pt;
+}
+
+void Performance::set_process_message_queue_time(double p_pt) {
+	_process_message_queue_time = p_pt;
+}
+
+void Performance::set_process_navigation_idle_time(double p_pt) {
+	_process_navigation_idle_time = p_pt;
+}
+
+void Performance::set_process_render_sync_time(double p_pt) {
+	_process_render_sync_time = p_pt;
+}
+
+void Performance::set_process_render_draw_time(double p_pt) {
+	_process_render_draw_time = p_pt;
+}
+
+// DUMBAI: SceneTree instrumentation updates these per frame so benchmark CSV captures direct _process phase costs.
+void Performance::set_process_scene_tree_fti_time(double p_pt) {
+	_process_scene_tree_fti_time = p_pt;
+}
+
+void Performance::set_process_scene_tree_main_loop_time(double p_pt) {
+	_process_scene_tree_main_loop_time = p_pt;
+}
+
+void Performance::set_process_scene_tree_multiplayer_time(double p_pt) {
+	_process_scene_tree_multiplayer_time = p_pt;
+}
+
+void Performance::set_process_scene_tree_signal_time(double p_pt) {
+	_process_scene_tree_signal_time = p_pt;
+}
+
+void Performance::set_process_scene_tree_message_queue_time(double p_pt) {
+	_process_scene_tree_message_queue_time = p_pt;
+}
+
+void Performance::set_process_scene_tree_transform_flush_time(double p_pt) {
+	_process_scene_tree_transform_flush_time = p_pt;
+}
+
+void Performance::set_process_scene_tree_groups_time(double p_pt) {
+	_process_scene_tree_groups_time = p_pt;
+}
+
+void Performance::set_process_scene_tree_ugc_time(double p_pt) {
+	_process_scene_tree_ugc_time = p_pt;
+}
+
+void Performance::set_process_scene_tree_scene_change_time(double p_pt) {
+	_process_scene_tree_scene_change_time = p_pt;
+}
+
+void Performance::set_process_scene_tree_timers_time(double p_pt) {
+	_process_scene_tree_timers_time = p_pt;
+}
+
+void Performance::set_process_scene_tree_tweens_time(double p_pt) {
+	_process_scene_tree_tweens_time = p_pt;
+}
+
+void Performance::set_process_scene_tree_delete_queue_time(double p_pt) {
+	_process_scene_tree_delete_queue_time = p_pt;
+}
+
+void Performance::set_process_scene_tree_accessibility_time(double p_pt) {
+	_process_scene_tree_accessibility_time = p_pt;
+}
+
+void Performance::set_process_scene_tree_idle_callbacks_time(double p_pt) {
+	_process_scene_tree_idle_callbacks_time = p_pt;
+}
+
+void Performance::set_process_scene_tree_other_time(double p_pt) {
+	_process_scene_tree_other_time = p_pt;
 }
 
 void Performance::add_custom_monitor(const StringName &p_id, const Callable &p_callable, const Vector<Variant> &p_args, MonitorType p_type) {
@@ -607,6 +1041,38 @@ Performance::Performance() {
 	_process_time = 0;
 	_physics_process_time = 0;
 	_navigation_process_time = 0;
+	_process_main_loop_time = 0;
+	_process_message_queue_time = 0;
+	_process_navigation_idle_time = 0;
+	_process_render_sync_time = 0;
+	_process_render_draw_time = 0;
+	// DUMBAI: Initialize SceneTree sub-stage timings so monitors stay deterministic when instrumentation has not run yet.
+	_process_scene_tree_fti_time = 0;
+	_process_scene_tree_main_loop_time = 0;
+	_process_scene_tree_multiplayer_time = 0;
+	_process_scene_tree_signal_time = 0;
+	_process_scene_tree_message_queue_time = 0;
+	_process_scene_tree_transform_flush_time = 0;
+	_process_scene_tree_groups_time = 0;
+	_process_scene_tree_ugc_time = 0;
+	_process_scene_tree_scene_change_time = 0;
+	_process_scene_tree_timers_time = 0;
+	_process_scene_tree_tweens_time = 0;
+	_process_scene_tree_delete_queue_time = 0;
+	_process_scene_tree_accessibility_time = 0;
+	_process_scene_tree_idle_callbacks_time = 0;
+	_process_scene_tree_other_time = 0;
+	// DUMBAI: Reset render profile cache so first monitor query after startup recomputes from the latest frame profile.
+	_render_profile_capture_enabled = false;
+	_render_profile_cached_frame = 0;
+	_render_profile_cache_valid = false;
+	_render_profile_cpu_total_time = 0.0;
+	_render_profile_gpu_total_time = 0.0;
+	_render_profile_cpu_max_stage_time = 0.0;
+	_render_profile_gpu_max_stage_time = 0.0;
+	_render_profile_stage_count = 0.0;
+	_render_profile_gpu_nonzero_stage_count = 0.0;
+	_render_profile_gpu_zero_stage_count = 0.0;
 	_monitor_modification_time = 0;
 	singleton = this;
 }

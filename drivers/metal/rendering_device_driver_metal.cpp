@@ -54,6 +54,7 @@
 #include "core/config/project_settings.h"
 #include "core/io/marshalls.h"
 #include "core/os/os.h"
+#include "core/string/print_string.h"
 #include "core/string/ustring.h"
 #include "core/templates/hash_map.h"
 #include "drivers/apple/foundation_helpers.h"
@@ -2348,16 +2349,195 @@ void RenderingDeviceDriverMetal::command_trace_rays(CommandBufferID p_cmd_buffer
 
 // ----- TIMESTAMP -----
 
+namespace {
+
+struct TimestampQueryPoolInfo {
+	NS::SharedPtr<MTL::CounterSampleBuffer> sample_buffer;
+	uint32_t query_count = 0;
+};
+
+// DUMBAI: Keep metal timestamp diagnostics readable by logging early calls and then sampling periodically.
+static bool _dumbai_metal_timestamp_should_log(uint32_t &p_counter, uint32_t p_early_limit = 24, uint32_t p_period = 240) {
+	p_counter += 1;
+	return p_counter <= p_early_limit || (p_period > 0 && (p_counter % p_period) == 0);
+}
+
+static uint32_t g_dumbai_metal_timestamp_create_counter = 0;
+static uint32_t g_dumbai_metal_timestamp_resolve_counter = 0;
+static uint32_t g_dumbai_metal_timestamp_resolve_zero_counter = 0;
+static uint32_t g_dumbai_metal_timestamp_write_counter = 0;
+static uint32_t g_dumbai_metal_timestamp_write_fail_counter = 0;
+
+// DUMBAI: Guard timestamp sampling behind explicit capability checks so unsupported GPUs keep deterministic zero telemetry instead of validation failures.
+static bool _supports_metal_timestamp_sampling(MTL::Device *p_device) {
+	ERR_FAIL_NULL_V(p_device, false);
+	return p_device->supportsCounterSampling(MTL::CounterSamplingPointAtDrawBoundary) ||
+			p_device->supportsCounterSampling(MTL::CounterSamplingPointAtDispatchBoundary) ||
+			p_device->supportsCounterSampling(MTL::CounterSamplingPointAtBlitBoundary);
+}
+
+// DUMBAI: Resolve the hardware timestamp counter set once per query-pool creation to keep the hot command path allocation-free.
+static MTL::CounterSet *_find_metal_timestamp_counter_set(MTL::Device *p_device) {
+	ERR_FAIL_NULL_V(p_device, nullptr);
+	NS::Array *counter_sets = p_device->counterSets();
+	if (counter_sets == nullptr) {
+		return nullptr;
+	}
+
+	for (NS::UInteger i = 0; i < counter_sets->count(); i++) {
+		MTL::CounterSet *counter_set = counter_sets->object<MTL::CounterSet>(i);
+		if (counter_set == nullptr || counter_set->name() == nullptr) {
+			continue;
+		}
+		if (counter_set->name()->isEqualToString(MTL::CommonCounterSetTimestamp)) {
+			return counter_set;
+		}
+	}
+
+	return nullptr;
+}
+
+// DUMBAI: Some devices expose the set name but not every counter, so verify the timestamp counter explicitly before creating the pool.
+static bool _counter_set_has_metal_timestamp_counter(MTL::CounterSet *p_counter_set) {
+	ERR_FAIL_NULL_V(p_counter_set, false);
+	NS::Array *counters = p_counter_set->counters();
+	if (counters == nullptr) {
+		return false;
+	}
+
+	for (NS::UInteger i = 0; i < counters->count(); i++) {
+		MTL::Counter *counter = counters->object<MTL::Counter>(i);
+		if (counter == nullptr || counter->name() == nullptr) {
+			continue;
+		}
+		if (counter->name()->isEqualToString(MTL::CommonCounterTimestamp)) {
+			return true;
+		}
+	}
+
+	return false;
+}
+
+} // namespace
+
 RDD::QueryPoolID RenderingDeviceDriverMetal::timestamp_query_pool_create(uint32_t p_query_count) {
-	return QueryPoolID(1);
+	ERR_FAIL_COND_V(p_query_count == 0, QueryPoolID());
+	ERR_FAIL_NULL_V(device, QueryPoolID());
+
+	const bool supports_stage_boundary = device->supportsCounterSampling(MTL::CounterSamplingPointAtStageBoundary);
+	const bool supports_draw_boundary = device->supportsCounterSampling(MTL::CounterSamplingPointAtDrawBoundary);
+	const bool supports_dispatch_boundary = device->supportsCounterSampling(MTL::CounterSamplingPointAtDispatchBoundary);
+	const bool supports_blit_boundary = device->supportsCounterSampling(MTL::CounterSamplingPointAtBlitBoundary);
+	const bool should_log_create = _dumbai_metal_timestamp_should_log(g_dumbai_metal_timestamp_create_counter);
+	if (should_log_create) {
+		print_line(vformat(
+				"DUMBAI: metal_timestamp/create query_count=%d supports(stage=%s draw=%s dispatch=%s blit=%s)",
+				int(p_query_count),
+				supports_stage_boundary ? "true" : "false",
+				supports_draw_boundary ? "true" : "false",
+				supports_dispatch_boundary ? "true" : "false",
+				supports_blit_boundary ? "true" : "false"));
+	}
+
+	if (!_supports_metal_timestamp_sampling(device)) {
+		if (should_log_create) {
+			print_line("DUMBAI: metal_timestamp/create skipped because no supported counter sampling points were reported by the device");
+		}
+		return QueryPoolID();
+	}
+
+	MTL::CounterSet *timestamp_counter_set = _find_metal_timestamp_counter_set(device);
+	if (timestamp_counter_set == nullptr || !_counter_set_has_metal_timestamp_counter(timestamp_counter_set)) {
+		if (should_log_create) {
+			print_line("DUMBAI: metal_timestamp/create skipped because timestamp counter set or counter was unavailable");
+		}
+		return QueryPoolID();
+	}
+
+	NS::SharedPtr<MTL::CounterSampleBufferDescriptor> descriptor = NS::TransferPtr(MTL::CounterSampleBufferDescriptor::alloc()->init());
+	descriptor->setCounterSet(timestamp_counter_set);
+	descriptor->setSampleCount(p_query_count);
+	descriptor->setStorageMode(MTL::StorageModeShared);
+
+	NS::Error *error = nullptr;
+	MTL::CounterSampleBuffer *sample_buffer = device->newCounterSampleBuffer(descriptor.get(), &error);
+	if (sample_buffer == nullptr || error != nullptr) {
+		if (error != nullptr) {
+			WARN_PRINT("Failed to create Metal timestamp counter sample buffer: " + String(error->localizedDescription()->utf8String()));
+		}
+		if (should_log_create) {
+			print_line("DUMBAI: metal_timestamp/create failed creating counter sample buffer");
+		}
+		return QueryPoolID();
+	}
+
+	TimestampQueryPoolInfo *pool = memnew(TimestampQueryPoolInfo);
+	pool->sample_buffer = NS::TransferPtr(sample_buffer);
+	pool->query_count = p_query_count;
+	if (should_log_create) {
+		print_line("DUMBAI: metal_timestamp/create success pool=" + itos((int64_t)pool) + " sample_count=" + itos(pool->query_count));
+	}
+
+	return QueryPoolID(pool);
 }
 
 void RenderingDeviceDriverMetal::timestamp_query_pool_free(QueryPoolID p_pool_id) {
+	if (!p_pool_id.id) {
+		return;
+	}
+
+	TimestampQueryPoolInfo *pool = reinterpret_cast<TimestampQueryPoolInfo *>(p_pool_id.id);
+	memdelete(pool);
 }
 
 void RenderingDeviceDriverMetal::timestamp_query_pool_get_results(QueryPoolID p_pool_id, uint32_t p_query_count, uint64_t *r_results) {
-	// Metal doesn't support timestamp queries, so we just clear the buffer.
+	// DUMBAI: Always zero the destination first so missing/invalid sample slots remain deterministic in CSV exports.
 	bzero(r_results, p_query_count * sizeof(uint64_t));
+
+	if (!p_pool_id.id || p_query_count == 0) {
+		return;
+	}
+
+	TimestampQueryPoolInfo *pool = reinterpret_cast<TimestampQueryPoolInfo *>(p_pool_id.id);
+	if (pool->sample_buffer.get() == nullptr) {
+		return;
+	}
+
+	const uint32_t sample_count = MIN(p_query_count, pool->query_count);
+	if (sample_count == 0) {
+		return;
+	}
+
+	NS::Data *resolved_range = pool->sample_buffer->resolveCounterRange(NS::Range(0, sample_count));
+	if (resolved_range == nullptr || resolved_range->bytes() == nullptr) {
+		if (_dumbai_metal_timestamp_should_log(g_dumbai_metal_timestamp_resolve_counter)) {
+			print_line("DUMBAI: metal_timestamp/resolve pool=" + itos((int64_t)pool) + " sample_count=" + itos(sample_count) + " resolved=null");
+		}
+		return;
+	}
+
+	const uint32_t resolved_count = MIN(sample_count, static_cast<uint32_t>(resolved_range->length() / sizeof(MTL::CounterResultTimestamp)));
+	const MTL::CounterResultTimestamp *timestamps = reinterpret_cast<const MTL::CounterResultTimestamp *>(resolved_range->bytes());
+	uint32_t nonzero_count = 0;
+	uint64_t max_timestamp = 0;
+	for (uint32_t i = 0; i < resolved_count; i++) {
+		const uint64_t timestamp = timestamps[i].timestamp;
+		r_results[i] = timestamp;
+		if (timestamp > 0) {
+			nonzero_count += 1;
+			max_timestamp = MAX(max_timestamp, timestamp);
+		}
+	}
+
+	if (_dumbai_metal_timestamp_should_log(g_dumbai_metal_timestamp_resolve_counter) || (nonzero_count == 0 && _dumbai_metal_timestamp_should_log(g_dumbai_metal_timestamp_resolve_zero_counter, 48, 120))) {
+		print_line(
+				"DUMBAI: metal_timestamp/resolve pool=" + itos((int64_t)pool) +
+				" sample_count=" + itos(sample_count) +
+				" resolved_count=" + itos(resolved_count) +
+				" resolved_bytes=" + itos((int64_t)resolved_range->length()) +
+				" nonzero=" + itos(nonzero_count) +
+				" max=" + String::num_uint64(max_timestamp));
+	}
 }
 
 uint64_t RenderingDeviceDriverMetal::timestamp_query_result_to_time(uint64_t p_result) {
@@ -2368,6 +2548,28 @@ void RenderingDeviceDriverMetal::command_timestamp_query_pool_reset(CommandBuffe
 }
 
 void RenderingDeviceDriverMetal::command_timestamp_write(CommandBufferID p_cmd_buffer, QueryPoolID p_pool_id, uint32_t p_index) {
+	if (!p_pool_id.id) {
+		return;
+	}
+
+	TimestampQueryPoolInfo *pool = reinterpret_cast<TimestampQueryPoolInfo *>(p_pool_id.id);
+	if (pool->sample_buffer.get() == nullptr || p_index >= pool->query_count) {
+		return;
+	}
+
+	MDCommandBufferBase *cb = (MDCommandBufferBase *)(p_cmd_buffer.id);
+	ERR_FAIL_NULL(cb);
+	const bool sampled = cb->sample_timestamp(pool->sample_buffer.get(), p_index);
+	if (_dumbai_metal_timestamp_should_log(g_dumbai_metal_timestamp_write_counter, 32, 300)) {
+		print_line(
+				"DUMBAI: metal_timestamp/write pool=" + itos((int64_t)pool) +
+				" index=" + itos(p_index) +
+				" sampled=" + String(sampled ? "true" : "false") +
+				" query_count=" + itos(pool->query_count));
+	}
+	if (!sampled && _dumbai_metal_timestamp_should_log(g_dumbai_metal_timestamp_write_fail_counter, 64, 120)) {
+		print_line("DUMBAI: metal_timestamp/write sample failed pool=" + itos((int64_t)pool) + " index=" + itos(p_index));
+	}
 }
 
 #pragma mark - Labels

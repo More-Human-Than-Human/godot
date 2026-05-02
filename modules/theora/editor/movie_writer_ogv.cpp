@@ -142,9 +142,10 @@ Error MovieWriterOGV::write_begin(const Size2i &p_movie_size, uint32_t p_fps, co
 	audio_frames = mix_rate / fps;
 
 	// Set up Ogg output streams.
-	srand(time(nullptr));
-	ogg_stream_init(&to, rand()); // Video.
-	ogg_stream_init(&vo, rand()); // Audio.
+	// DUMBAI: Use Godot RNG helpers so this code does not depend on C stdlib rand/srand declarations.
+	Math::randomize();
+	ogg_stream_init(&to, Math::rand()); // Video.
+	ogg_stream_init(&vo, Math::rand()); // Audio.
 
 	// Initialize Vorbis audio encoding.
 	vorbis_info_init(&vi);

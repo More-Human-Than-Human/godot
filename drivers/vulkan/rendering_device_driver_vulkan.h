@@ -151,6 +151,10 @@ class RenderingDeviceDriverVulkan : public RenderingDeviceDriver {
 	HashSet<CharString> enabled_device_extension_names;
 	TightLocalVector<TightLocalVector<Queue>> queue_families;
 	TightLocalVector<VkQueueFamilyProperties> queue_family_properties;
+	// DUMBAI: Track timestamp capability of the selected main queue so GPU profiler export can deterministically enable/disable Vulkan timestamp queries.
+	uint32_t main_queue_family_index = UINT32_MAX;
+	uint32_t main_queue_timestamp_valid_bits = 0;
+	bool main_queue_supports_timestamps = false;
 	RDD::Capabilities device_capabilities;
 	SubgroupCapabilities subgroup_capabilities;
 	MultiviewCapabilities multiview_capabilities;

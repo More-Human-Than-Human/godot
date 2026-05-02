@@ -54,10 +54,24 @@
 #include "drivers/metal/pixel_formats.h"
 #include "drivers/metal/rendering_device_driver_metal3.h"
 #include "drivers/metal/rendering_shader_container_metal.h"
+#include "core/string/print_string.h"
 
 #include <algorithm>
 
 using namespace MTL3;
+
+namespace {
+
+// DUMBAI: Keep command-buffer timestamp diagnostics readable by logging early events then periodic samples.
+static bool _dumbai_metal_cb_timestamp_should_log(uint32_t &p_counter, uint32_t p_early_limit = 32, uint32_t p_period = 300) {
+	p_counter += 1;
+	return p_counter <= p_early_limit || (p_period > 0 && (p_counter % p_period) == 0);
+}
+
+static uint32_t g_dumbai_metal_cb_timestamp_sample_counter = 0;
+static uint32_t g_dumbai_metal_cb_timestamp_sample_fail_counter = 0;
+
+} // namespace
 
 MDCommandBuffer::MDCommandBuffer(MTL::CommandQueue *p_queue, ::RenderingDeviceDriverMetal *p_device_driver) :
 		_scratch(p_queue->device()), queue(p_queue) {
@@ -211,6 +225,84 @@ void MDCommandBuffer::pipeline_barrier(BitField<RDD::PipelineStageBits> p_src_st
 		pending_after_stages[STAGE_BLIT] |= after_stages;
 		pending_before_queue_stages[STAGE_BLIT] |= before_stages;
 	}
+}
+
+bool MDCommandBuffer::sample_timestamp(MTL::CounterSampleBuffer *p_sample_buffer, uint32_t p_sample_index) {
+	ERR_FAIL_NULL_V(p_sample_buffer, false);
+
+	MTL::Device *mtl_device = device_driver->get_device();
+	ERR_FAIL_NULL_V(mtl_device, false);
+
+	const bool supports_stage_boundary = mtl_device->supportsCounterSampling(MTL::CounterSamplingPointAtStageBoundary);
+	const bool supports_draw_boundary = mtl_device->supportsCounterSampling(MTL::CounterSamplingPointAtDrawBoundary);
+	const bool supports_dispatch_boundary = mtl_device->supportsCounterSampling(MTL::CounterSamplingPointAtDispatchBoundary);
+	const bool supports_blit_boundary = mtl_device->supportsCounterSampling(MTL::CounterSamplingPointAtBlitBoundary);
+	const bool should_log_sample = _dumbai_metal_cb_timestamp_should_log(g_dumbai_metal_cb_timestamp_sample_counter);
+	if (should_log_sample) {
+		print_line(vformat(
+				"DUMBAI: metal_timestamp/cb_sample index=%d type=%d supports(stage=%s draw=%s dispatch=%s blit=%s) enc(render=%s compute=%s blit=%s)",
+				int(p_sample_index),
+				int(type),
+				supports_stage_boundary ? "true" : "false",
+				supports_draw_boundary ? "true" : "false",
+				supports_dispatch_boundary ? "true" : "false",
+				supports_blit_boundary ? "true" : "false",
+				render.encoder.get() != nullptr ? "true" : "false",
+				compute.encoder.get() != nullptr ? "true" : "false",
+				blit.encoder.get() != nullptr ? "true" : "false"));
+	}
+
+	switch (type) {
+		case MDCommandBufferStateType::Render: {
+			// DUMBAI: Render encoder counter sampling requires explicit draw-boundary support on this device family.
+			if (render.encoder.get() != nullptr && supports_draw_boundary) {
+				// DUMBAI: Force ordering before sampling so each captured marker reflects completed work in this encoder.
+				render.encoder->sampleCountersInBuffer(p_sample_buffer, p_sample_index, true);
+				return true;
+			}
+			if (_dumbai_metal_cb_timestamp_should_log(g_dumbai_metal_cb_timestamp_sample_fail_counter, 64, 120)) {
+				print_line("DUMBAI: metal_timestamp/cb_sample render sampling failed due to missing encoder or unsupported draw/stage boundary sampling");
+			}
+			return false;
+		}
+		case MDCommandBufferStateType::Compute: {
+			// DUMBAI: AGX on macOS currently asserts on compute encoder counter sampling even when capability queries suggest support.
+			// Keep compute-path timestamp sampling disabled so benchmark runs stay stable while we validate a safer compute sampling path.
+			(void)supports_dispatch_boundary;
+			if (_dumbai_metal_cb_timestamp_should_log(g_dumbai_metal_cb_timestamp_sample_fail_counter, 64, 120)) {
+				print_line("DUMBAI: metal_timestamp/cb_sample compute sampling intentionally disabled to avoid AGX compute counter assertion");
+			}
+			return false;
+		}
+		case MDCommandBufferStateType::Blit: {
+			// DUMBAI: Blit encoder sampling is only valid when AtBlitBoundary is supported; stage boundary support alone is insufficient on Apple GPUs.
+			if (blit.encoder.get() != nullptr && supports_blit_boundary) {
+				// DUMBAI: Blit fallback keeps timestamp capture available even when the graph is doing transfer-only work.
+				blit.encoder->sampleCountersInBuffer(p_sample_buffer, p_sample_index, true);
+				return true;
+			}
+			if (_dumbai_metal_cb_timestamp_should_log(g_dumbai_metal_cb_timestamp_sample_fail_counter, 64, 120)) {
+				print_line("DUMBAI: metal_timestamp/cb_sample blit sampling failed due to missing encoder or unsupported blit/stage boundary sampling");
+			}
+			return false;
+		}
+		case MDCommandBufferStateType::None: {
+			break;
+		}
+	}
+
+	if (!supports_blit_boundary) {
+		if (_dumbai_metal_cb_timestamp_should_log(g_dumbai_metal_cb_timestamp_sample_fail_counter, 64, 120)) {
+			print_line("DUMBAI: metal_timestamp/cb_sample idle sampling failed because blit boundary sampling is unsupported");
+		}
+		return false;
+	}
+
+	// DUMBAI: Graph markers can be emitted outside active passes, so we open a blit encoder only for timestamp sampling in idle state.
+	MTL::BlitCommandEncoder *blit_encoder = _ensure_blit_encoder();
+	ERR_FAIL_NULL_V(blit_encoder, false);
+	blit_encoder->sampleCountersInBuffer(p_sample_buffer, p_sample_index, true);
+	return true;
 }
 
 void MDCommandBuffer::bind_pipeline(RDD::PipelineID p_pipeline) {
