@@ -360,6 +360,28 @@ class EditorFileSystem : public Node {
 		int batch_size = 1;
 	};
 
+	struct ImportWorkResult {
+		String path;
+		String importer;
+		String group_file;
+		ResourceUID::ID uid = ResourceUID::INVALID_ID;
+		Error error = OK;
+		uint64_t duration_ms = 0;
+		uint64_t source_modified_time = 0;
+		uint64_t import_modified_time = 0;
+		String import_md5;
+		String type;
+		String resource_script_class;
+		bool import_valid = false;
+		bool threaded = false;
+		int threads_used = 1;
+		int thread_pool_size = 1;
+		int batch_size = 1;
+		Vector<String> dest_paths;
+		Vector<String> gen_files;
+		Vector<String> deps;
+	};
+
 	struct ImportTimingEntry {
 		uint64_t unix_time_ms = 0;
 		uint64_t duration_ms = 0;
@@ -378,6 +400,12 @@ class EditorFileSystem : public Node {
 	Vector<ImportTimingEntry> import_timing_entries;
 	void _record_import_timing(const String &p_file, const String &p_importer, const String &p_phase, uint64_t p_duration_ms, bool p_threaded, Error p_result, int p_threads_used = 1, int p_thread_pool_size = 1, int p_batch_size = 1);
 	void _flush_import_timing_csv();
+
+	Mutex import_work_results_mutex;
+	Vector<ImportWorkResult> import_work_results;
+	void _queue_import_work_result(const ImportWorkResult &p_result);
+	bool _pop_import_work_result(ImportWorkResult &r_result);
+	void _clear_import_work_results();
 
 	void _reimport_thread(uint32_t p_index, ImportThreadData *p_import_data);
 

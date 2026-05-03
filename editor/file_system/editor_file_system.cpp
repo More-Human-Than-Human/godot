@@ -3341,6 +3341,26 @@ void EditorFileSystem::_flush_import_timing_csv() {
 	csv_file->flush();
 }
 
+void EditorFileSystem::_queue_import_work_result(const ImportWorkResult &p_result) {
+	MutexLock lock(import_work_results_mutex);
+	import_work_results.push_back(p_result);
+}
+
+bool EditorFileSystem::_pop_import_work_result(ImportWorkResult &r_result) {
+	MutexLock lock(import_work_results_mutex);
+	if (import_work_results.is_empty()) {
+		return false;
+	}
+	r_result = import_work_results[0];
+	import_work_results.remove_at(0);
+	return true;
+}
+
+void EditorFileSystem::_clear_import_work_results() {
+	MutexLock lock(import_work_results_mutex);
+	import_work_results.clear();
+}
+
 void EditorFileSystem::_reimport_thread(uint32_t p_index, ImportThreadData *p_import_data) {
 	ResourceLoader::set_is_import_thread(true);
 	int file_idx = p_import_data->reimport_from + int(p_index);
