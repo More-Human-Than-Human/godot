@@ -3656,7 +3656,7 @@ void EditorFileSystem::reimport_files(const Vector<String> &p_files) {
 						thread_settings.priority = Thread::PRIORITY_NORMAL;
 						for (int thread_index = 0; thread_index < tdata.threads_used; thread_index++) {
 							Thread *scene_thread = memnew(Thread);
-							scene_threads.write[thread_index] = scene_thread;
+							scene_threads[thread_index] = scene_thread;
 							scene_thread->start(_scene_reimport_thread, &scene_thread_data, thread_settings);
 						}
 					} else {
