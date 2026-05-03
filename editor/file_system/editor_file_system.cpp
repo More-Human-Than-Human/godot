@@ -3434,6 +3434,26 @@ void EditorFileSystem::_commit_import_work_result(const ImportWorkResult &p_resu
 	_record_import_timing(file, p_result.importer, "commit_done", commit_duration_ms, p_result.threaded, commit_error, p_result.threads_used, p_result.thread_pool_size, p_result.batch_size);
 }
 
+void EditorFileSystem::_scene_reimport_thread(void *p_userdata) {
+	SceneImportThreadData *thread_data = (SceneImportThreadData *)p_userdata;
+	ERR_FAIL_NULL(thread_data);
+	ERR_FAIL_NULL(thread_data->filesystem);
+	ERR_FAIL_NULL(thread_data->import_data);
+
+	while (true) {
+		int local_index = -1;
+		{
+			MutexLock lock(thread_data->next_index_mutex);
+			if (thread_data->next_index >= thread_data->import_data->batch_size) {
+				break;
+			}
+			local_index = thread_data->next_index++;
+		}
+
+		thread_data->filesystem->_reimport_thread(uint32_t(local_index), thread_data->import_data);
+	}
+}
+
 void EditorFileSystem::_reimport_thread(uint32_t p_index, ImportThreadData *p_import_data) {
 	ResourceLoader::set_is_import_thread(true);
 	int file_idx = p_import_data->reimport_from + int(p_index);
@@ -3615,9 +3635,33 @@ void EditorFileSystem::reimport_files(const Vector<String> &p_files) {
 						importer_worker_limit = MIN(importer_worker_limit, scene_parallel_reimport_max_workers);
 					}
 					tdata.threads_used = MIN(item_count, importer_worker_limit);
-					print_line(vformat("Reimport batch \"%s\": assets=%d, workers=%d/%d", reimport_files[from].importer, item_count, tdata.threads_used, tdata.thread_pool_size));
+					const bool use_dedicated_scene_threads = is_scene_batch && tdata.threads_used > 1;
+					print_line(vformat("Reimport batch \"%s\": assets=%d, workers=%d/%d, mode=%s",
+							reimport_files[from].importer,
+							item_count,
+							tdata.threads_used,
+							tdata.thread_pool_size,
+							use_dedicated_scene_threads ? "dedicated_threads" : "worker_pool"));
 					_clear_import_work_results();
-					WorkerThreadPool::GroupID group_task = WorkerThreadPool::get_singleton()->add_template_group_task(this, &EditorFileSystem::_reimport_thread, &tdata, item_count, tdata.threads_used, false, vformat(TTR("Import resources of type: %s"), reimport_files[from].importer));
+
+					WorkerThreadPool::GroupID group_task = WorkerThreadPool::INVALID_TASK_ID;
+					LocalVector<Thread *> scene_threads;
+					SceneImportThreadData scene_thread_data;
+					if (use_dedicated_scene_threads) {
+						scene_thread_data.filesystem = this;
+						scene_thread_data.import_data = &tdata;
+						scene_threads.resize(tdata.threads_used);
+
+						Thread::Settings thread_settings;
+						thread_settings.priority = Thread::PRIORITY_NORMAL;
+						for (int thread_index = 0; thread_index < tdata.threads_used; thread_index++) {
+							Thread *scene_thread = memnew(Thread);
+							scene_threads.write[thread_index] = scene_thread;
+							scene_thread->start(_scene_reimport_thread, &scene_thread_data, thread_settings);
+						}
+					} else {
+						group_task = WorkerThreadPool::get_singleton()->add_template_group_task(this, &EditorFileSystem::_reimport_thread, &tdata, item_count, tdata.threads_used, false, vformat(TTR("Import resources of type: %s"), reimport_files[from].importer));
+					}
 
 					int imported_count = 0;
 					uint64_t last_wait_log_msec = OS::get_singleton()->get_ticks_msec();
@@ -3650,7 +3694,16 @@ void EditorFileSystem::reimport_files(const Vector<String> &p_files) {
 						OS::get_singleton()->delay_usec(1000);
 					}
 
-					WorkerThreadPool::get_singleton()->wait_for_group_task_completion(group_task);
+					if (use_dedicated_scene_threads) {
+						for (Thread *scene_thread : scene_threads) {
+							if (scene_thread->is_started()) {
+								scene_thread->wait_to_finish();
+							}
+							memdelete(scene_thread);
+						}
+					} else {
+						WorkerThreadPool::get_singleton()->wait_for_group_task_completion(group_task);
+					}
 					DEV_ASSERT(!imported_sem.try_wait());
 					ImportWorkResult remaining_result;
 					while (_pop_import_work_result(remaining_result)) {
