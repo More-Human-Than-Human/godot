@@ -305,6 +305,9 @@ CanvasItemMaterial::~CanvasItemMaterial() {
 			shader_map.erase(current_key);
 		}
 
-		RS::get_singleton()->material_set_shader(_get_material(), RID());
+		RID material_rid = _get_material();
+		if (material_rid.is_valid()) {
+			RS::get_singleton()->material_set_shader(material_rid, RID());
+		}
 	}
 }

@@ -2487,8 +2487,14 @@ void MaterialStorage::material_free(RID p_rid) {
 }
 
 void MaterialStorage::material_set_shader(RID p_material, RID p_shader) {
+	if (p_material.is_null()) {
+		return;
+	}
+
 	Material *material = material_owner.get_or_null(p_material);
-	ERR_FAIL_NULL(material);
+	if (material == nullptr) {
+		return;
+	}
 
 	if (material->data) {
 		memdelete(material->data);
