@@ -3370,6 +3370,18 @@ void EditorFileSystem::_reimport_thread(uint32_t p_index, ImportThreadData *p_im
 	Error import_error = _reimport_file(import_file.path);
 	const uint64_t duration_ms = OS::get_singleton()->get_ticks_msec() - start_time;
 	_record_import_timing(import_file.path, import_file.importer, "asset", duration_ms, true, import_error, p_import_data->threads_used, p_import_data->thread_pool_size, p_import_data->batch_size);
+
+	ImportWorkResult work_result;
+	work_result.path = import_file.path;
+	work_result.importer = import_file.importer;
+	work_result.error = import_error;
+	work_result.duration_ms = duration_ms;
+	work_result.threaded = true;
+	work_result.threads_used = p_import_data->threads_used;
+	work_result.thread_pool_size = p_import_data->thread_pool_size;
+	work_result.batch_size = p_import_data->batch_size;
+	_queue_import_work_result(work_result);
+
 	ResourceLoader::set_is_import_thread(false);
 
 	p_import_data->imported_sem->post();
@@ -3378,6 +3390,7 @@ void EditorFileSystem::_reimport_thread(uint32_t p_index, ImportThreadData *p_im
 void EditorFileSystem::reimport_files(const Vector<String> &p_files) {
 	ERR_FAIL_COND_MSG(importing, "Attempted to call reimport_files() recursively, this is not allowed.");
 	importing = true;
+	_clear_import_work_results();
 
 	Vector<String> reloads;
 	constexpr int PREPARE_PROGRESS_STEP_INTERVAL = 32;
@@ -3519,14 +3532,18 @@ void EditorFileSystem::reimport_files(const Vector<String> &p_files) {
 					const int importer_worker_limit = MAX(1, worker_thread_pool_size - 1);
 					tdata.threads_used = MIN(item_count, importer_worker_limit);
 					print_line(vformat("Reimport batch \"%s\": assets=%d, workers=%d/%d", reimport_files[from].importer, item_count, tdata.threads_used, tdata.thread_pool_size));
+					_clear_import_work_results();
 					WorkerThreadPool::GroupID group_task = WorkerThreadPool::get_singleton()->add_template_group_task(this, &EditorFileSystem::_reimport_thread, &tdata, item_count, tdata.threads_used, false, vformat(TTR("Import resources of type: %s"), reimport_files[from].importer));
 
 					int imported_count = 0;
 					uint64_t last_wait_log_msec = OS::get_singleton()->get_ticks_msec();
 					while (imported_count < item_count) {
 						if (imported_sem.try_wait()) {
+							ImportWorkResult completed_result;
+							const bool has_result = _pop_import_work_result(completed_result);
+							const String completed_label = has_result ? completed_result.path.get_file() : reimport_files[from + imported_count].path.get_file();
 							if (imported_count == 0 || ((imported_count + 1) % IMPORT_PROGRESS_STEP_INTERVAL) == 0 || imported_count + 1 == item_count) {
-								ep->step(reimport_files[from + imported_count].path.get_file(), from + imported_count, false);
+								ep->step(completed_label, from + imported_count, false);
 							}
 							imported_count++;
 							continue;
@@ -3545,6 +3562,10 @@ void EditorFileSystem::reimport_files(const Vector<String> &p_files) {
 
 					WorkerThreadPool::get_singleton()->wait_for_group_task_completion(group_task);
 					DEV_ASSERT(!imported_sem.try_wait());
+					ImportWorkResult remaining_result;
+					while (_pop_import_work_result(remaining_result)) {
+						// Drain any remaining work results from the queue for the next batch.
+					}
 
 					importer->import_threaded_end();
 				}
