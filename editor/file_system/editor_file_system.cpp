@@ -3364,10 +3364,17 @@ void EditorFileSystem::_clear_import_work_results() {
 }
 
 void EditorFileSystem::_commit_import_work_result(const ImportWorkResult &p_result) {
+	_record_import_timing(p_result.path, p_result.importer, "commit_start", 0, p_result.threaded, p_result.error, p_result.threads_used, p_result.thread_pool_size, p_result.batch_size);
+	const uint64_t commit_start_time = OS::get_singleton()->get_ticks_msec();
+	Error commit_error = OK;
+
 	const String &file = p_result.path;
 	EditorFileSystemDirectory *fs = nullptr;
 	int cpos = -1;
 	if (!_find_file(file, &fs, cpos)) {
+		commit_error = ERR_FILE_NOT_FOUND;
+		const uint64_t commit_duration_ms = OS::get_singleton()->get_ticks_msec() - commit_start_time;
+		_record_import_timing(file, p_result.importer, "commit_done", commit_duration_ms, p_result.threaded, commit_error, p_result.threads_used, p_result.thread_pool_size, p_result.batch_size);
 		return;
 	}
 
@@ -3422,6 +3429,9 @@ void EditorFileSystem::_commit_import_work_result(const ImportWorkResult &p_resu
 	}
 
 	EditorResourcePreview::get_singleton()->check_for_invalidation(file);
+
+	const uint64_t commit_duration_ms = OS::get_singleton()->get_ticks_msec() - commit_start_time;
+	_record_import_timing(file, p_result.importer, "commit_done", commit_duration_ms, p_result.threaded, commit_error, p_result.threads_used, p_result.thread_pool_size, p_result.batch_size);
 }
 
 void EditorFileSystem::_reimport_thread(uint32_t p_index, ImportThreadData *p_import_data) {
@@ -3429,9 +3439,11 @@ void EditorFileSystem::_reimport_thread(uint32_t p_index, ImportThreadData *p_im
 	int file_idx = p_import_data->reimport_from + int(p_index);
 	const ImportFile &import_file = p_import_data->reimport_files[file_idx];
 	_record_import_timing(import_file.path, import_file.importer, "asset_start", 0, true, OK, p_import_data->threads_used, p_import_data->thread_pool_size, p_import_data->batch_size);
+	_record_import_timing(import_file.path, import_file.importer, "worker_start", 0, true, OK, p_import_data->threads_used, p_import_data->thread_pool_size, p_import_data->batch_size);
 	const uint64_t start_time = OS::get_singleton()->get_ticks_msec();
 	Error import_error = _reimport_file(import_file.path, HashMap<StringName, Variant>(), String(), nullptr, false, true);
 	const uint64_t duration_ms = OS::get_singleton()->get_ticks_msec() - start_time;
+	_record_import_timing(import_file.path, import_file.importer, "worker_done", duration_ms, true, import_error, p_import_data->threads_used, p_import_data->thread_pool_size, p_import_data->batch_size);
 	_record_import_timing(import_file.path, import_file.importer, "asset", duration_ms, true, import_error, p_import_data->threads_used, p_import_data->thread_pool_size, p_import_data->batch_size);
 
 	ImportWorkResult work_result;
