@@ -3455,6 +3455,10 @@ void EditorFileSystem::reimport_files(const Vector<String> &p_files) {
 	importing = true;
 	_clear_import_work_results();
 
+	const bool enable_scene_parallel_reimport = bool(GLOBAL_DEF("editor/import/experimental/enable_scene_parallel_reimport", false));
+	int scene_parallel_reimport_max_workers = int(GLOBAL_DEF("editor/import/experimental/scene_parallel_reimport_max_workers", 2));
+	scene_parallel_reimport_max_workers = MAX(1, scene_parallel_reimport_max_workers);
+
 	Vector<String> reloads;
 	constexpr int PREPARE_PROGRESS_STEP_INTERVAL = 32;
 	constexpr int IMPORT_PROGRESS_STEP_INTERVAL = 1;
@@ -3517,9 +3521,10 @@ void EditorFileSystem::reimport_files(const Vector<String> &p_files) {
 				// Keep a non-empty marker for diagnostics and deterministic sort/group behavior.
 				ifile.importer = "<unresolved>";
 			}
-			// Scene importer path is not safe to run on worker threads (touches editor/main-thread systems).
-			if (ifile.importer == "scene" || ifile.importer == "animation_library" || ifile.importer == "ArrayMesh" || ifile.importer == "MeshLibrary") {
-				ifile.threaded = false;
+			const bool is_scene_importer = ifile.importer == "scene" || ifile.importer == "animation_library" || ifile.importer == "ArrayMesh" || ifile.importer == "MeshLibrary";
+			// Scene-family importers remain serial unless experimental threaded mode is explicitly enabled.
+			if (is_scene_importer) {
+				ifile.threaded = enable_scene_parallel_reimport;
 			}
 			reloads.push_back(file);
 			reimport_files.push_back(ifile);
@@ -3592,7 +3597,11 @@ void EditorFileSystem::reimport_files(const Vector<String> &p_files) {
 					int item_count = i - from + 1;
 					tdata.thread_pool_size = worker_thread_pool_size;
 					tdata.batch_size = item_count;
-					const int importer_worker_limit = MAX(1, worker_thread_pool_size - 1);
+					int importer_worker_limit = MAX(1, worker_thread_pool_size - 1);
+					const bool is_scene_batch = reimport_files[from].importer == "scene" || reimport_files[from].importer == "animation_library" || reimport_files[from].importer == "ArrayMesh" || reimport_files[from].importer == "MeshLibrary";
+					if (is_scene_batch) {
+						importer_worker_limit = MIN(importer_worker_limit, scene_parallel_reimport_max_workers);
+					}
 					tdata.threads_used = MIN(item_count, importer_worker_limit);
 					print_line(vformat("Reimport batch \"%s\": assets=%d, workers=%d/%d", reimport_files[from].importer, item_count, tdata.threads_used, tdata.thread_pool_size));
 					_clear_import_work_results();
