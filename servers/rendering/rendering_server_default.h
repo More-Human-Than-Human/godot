@@ -324,10 +324,9 @@ public:
 	virtual RID material_create_from_shader(RID p_next_pass, int p_render_priority, RID p_shader) override {
 		RID material = RSG::material_storage->material_allocate();
 		bool using_server_thread = Thread::get_caller_id() == server_thread;
-		if (using_server_thread || RSG::rasterizer->can_create_resources_async()) {
-			if (using_server_thread) {
-				command_queue.flush_if_pending();
-			}
+		// Material-to-shader ownership bookkeeping is shared state, so keep it serialized on the server thread.
+		if (using_server_thread) {
+			command_queue.flush_if_pending();
 
 			RSG::material_storage->material_initialize(material);
 			RSG::material_storage->material_set_next_pass(material, p_next_pass);

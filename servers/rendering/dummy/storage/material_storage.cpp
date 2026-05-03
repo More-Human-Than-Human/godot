@@ -246,14 +246,8 @@ void MaterialStorage::material_free(RID p_rid) {
 }
 
 void MaterialStorage::material_set_shader(RID p_material, RID p_shader) {
-	if (p_material.is_null()) {
-		return;
-	}
-
 	DummyMaterial *material = material_owner.get_or_null(p_material);
-	if (material == nullptr) {
-		return;
-	}
+	ERR_FAIL_NULL(material);
 
 	material->shader = p_shader;
 }
