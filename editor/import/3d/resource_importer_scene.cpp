@@ -36,6 +36,7 @@
 #include "core/io/resource_saver.h"
 #include "core/object/class_db.h"
 #include "core/object/script_language.h"
+#include "core/os/thread.h"
 #include "editor/editor_interface.h"
 #include "editor/editor_node.h"
 #include "editor/import/3d/scene_import_settings.h"
@@ -3413,6 +3414,13 @@ Error ResourceImporterScene::import(ResourceUID::ID p_source_id, const String &p
 	String post_import_script_path = p_options["import_script/path"];
 
 	Ref<EditorScenePostImport> post_import_script;
+	auto add_import_error = [](const String &p_message) {
+		if (Thread::is_main_thread()) {
+			EditorNode::add_io_error(p_message);
+		} else {
+			ResourceLoader::notify_load_error(p_message);
+		}
+	};
 
 	if (!post_import_script_path.is_empty()) {
 		if (post_import_script_path.is_relative_path()) {
@@ -3420,14 +3428,14 @@ Error ResourceImporterScene::import(ResourceUID::ID p_source_id, const String &p
 		}
 		Ref<Script> scr = ResourceLoader::load(post_import_script_path);
 		if (scr.is_null()) {
-			EditorNode::add_io_error(TTR("Couldn't load post-import script:") + " " + post_import_script_path);
+			add_import_error(TTR("Couldn't load post-import script:") + " " + post_import_script_path);
 		} else if (scr->get_instance_base_type() != "EditorScenePostImport") {
-			EditorNode::add_io_error(TTR("Script is not a subtype of EditorScenePostImport:") + " " + post_import_script_path);
+			add_import_error(TTR("Script is not a subtype of EditorScenePostImport:") + " " + post_import_script_path);
 		} else {
 			post_import_script.instantiate();
 			post_import_script->set_script(scr);
 			if (!post_import_script->get_script_instance()) {
-				EditorNode::add_io_error(TTR("Invalid/broken script for post-import (check console):") + " " + post_import_script_path);
+				add_import_error(TTR("Invalid/broken script for post-import (check console):") + " " + post_import_script_path);
 				post_import_script.unref();
 				return ERR_CANT_CREATE;
 			}
@@ -3451,7 +3459,7 @@ Error ResourceImporterScene::import(ResourceUID::ID p_source_id, const String &p
 		post_import_script->init(p_source_file);
 		scene = post_import_script->post_import(scene);
 		if (!scene) {
-			EditorNode::add_io_error(
+			add_import_error(
 					TTR("Error running post-import script:") + " " + post_import_script_path + "\n" +
 					TTR("Did you return a Node-derived object in the `_post_import()` method?"));
 			return err;
@@ -3496,7 +3504,9 @@ Error ResourceImporterScene::import(ResourceUID::ID p_source_id, const String &p
 		print_verbose("Saving scene to: " + p_save_path + ".scn");
 		err = ResourceSaver::save(packer, p_save_path + ".scn", flags); //do not take over, let the changed files reload themselves
 		ERR_FAIL_COND_V_MSG(err != OK, err, "Cannot save scene to file '" + p_save_path + ".scn'.");
-		EditorInterface::get_singleton()->make_scene_preview(p_source_file, scene, 1024);
+		if (Thread::is_main_thread()) {
+			EditorInterface::get_singleton()->make_scene_preview(p_source_file, scene, 1024);
+		}
 	} else if (_scene_import_type == "ArrayMesh") {
 		_save_scene_as_single_mesh(p_source_file, p_save_path, scene, p_options, flags);
 	} else if (_scene_import_type == "MeshLibrary") {
