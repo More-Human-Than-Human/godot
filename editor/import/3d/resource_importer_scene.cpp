@@ -471,6 +471,15 @@ static String _fixstr(const String &p_what, const String &p_str) {
 	return what;
 }
 
+static String _make_scene_import_progress_task_id(const String &p_base_task, const String &p_source_file) {
+	if (Thread::is_main_thread()) {
+		return p_base_task;
+	}
+	// Background progress task ids are global in the editor. Use a per-source+thread suffix
+	// so parallel scene imports do not collide on the shared "import" task key.
+	return p_base_task + ":" + p_source_file + ":" + itos((int64_t)Thread::get_caller_id());
+}
+
 static void _pre_gen_shape_list(Ref<ImporterMesh> &mesh, Vector<Ref<Shape3D>> &r_shape_list, bool p_convex) {
 	ERR_FAIL_COND_MSG(mesh.is_null(), "Cannot generate shape list with null mesh value.");
 	if (!p_convex) {
@@ -3113,7 +3122,7 @@ Node *ResourceImporterScene::pre_import(const String &p_source_file, const HashM
 	String ext = p_source_file.get_extension().to_lower();
 
 	// TRANSLATORS: This is an editor progress label.
-	EditorProgress progress("pre-import", TTR("Pre-Import Scene"), 0);
+	EditorProgress progress(_make_scene_import_progress_task_id("pre-import", p_source_file), TTR("Pre-Import Scene"), 0);
 	progress.step(TTR("Importing Scene..."), 0);
 
 	for (Ref<EditorSceneFormatImporter> importer_elem : scene_importers) {
@@ -3222,7 +3231,7 @@ Error ResourceImporterScene::import(ResourceUID::ID p_source_id, const String &p
 	Ref<EditorSceneFormatImporter> importer;
 	String ext = src_path.get_extension().to_lower();
 
-	EditorProgress progress("import", TTR("Import Scene"), 104);
+	EditorProgress progress(_make_scene_import_progress_task_id("import", p_source_file), TTR("Import Scene"), 104);
 	progress.step(TTR("Importing Scene..."), 0);
 
 	for (Ref<EditorSceneFormatImporter> importer_elem : scene_importers) {
