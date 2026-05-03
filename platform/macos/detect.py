@@ -1,4 +1,5 @@
 import os
+import shutil
 import sys
 from typing import TYPE_CHECKING
 
@@ -49,6 +50,7 @@ def get_opts():
         ("MACOS_SDK_PATH", "Path to the macOS SDK", ""),
         ("vulkan_sdk_path", "Path to the Vulkan SDK", ""),
         EnumVariable("macports_clang", "Build using Clang from MacPorts", "no", ["no", "5.0", "devel"], ignorecase=2),
+        EnumVariable("linker", "Linker program", "default", ["default", "lld"], ignorecase=2),
         BoolVariable("use_ubsan", "Use LLVM/GCC compiler undefined behavior sanitizer (UBSAN)", False),
         BoolVariable("use_asan", "Use LLVM/GCC compiler address sanitizer (ASAN)", False),
         BoolVariable("use_tsan", "Use LLVM/GCC compiler thread sanitizer (TSAN)", False),
@@ -117,6 +119,13 @@ def configure(env: "SConsEnvironment"):
 
     env.Append(CCFLAGS=["-ffp-contract=off"])
     env.Append(CCFLAGS=["-fobjc-arc", "-fvisibility=hidden"])
+
+    if env["linker"] == "lld":
+        linker = shutil.which("ld64.lld")
+        if linker is None:
+            print_error("Couldn't find ld64.lld. Install LLVM or use linker=default.")
+            sys.exit(255)
+        env.Append(LINKFLAGS=["-fuse-ld=" + linker])
 
     cc_version = get_compiler_version(env)
     cc_version_major = cc_version["apple_major"]

@@ -324,16 +324,26 @@ void EditorFileSystem::_first_scan_filesystem() {
 		_load_first_scan_root_dir();
 	}
 
-	// Preloading GDExtensions file extensions to prevent looping on all the resource loaders
-	// for each files in _first_scan_process_scripts.
-	List<String> gdextension_extensions;
-	ResourceLoader::get_recognized_extensions_for_type("GDExtension", &gdextension_extensions);
+	// Preload GDExtension and script extensions so lookups stay O(1) while scanning large trees.
+	HashSet<String> gdextension_extensions;
+	{
+		List<String> gdextension_extensions_list;
+		ResourceLoader::get_recognized_extensions_for_type("GDExtension", &gdextension_extensions_list);
+		for (const String &E : gdextension_extensions_list) {
+			gdextension_extensions.insert(E.to_lower());
+		}
+	}
+
+	HashSet<String> script_extensions;
+	for (int i = 0; i < ScriptServer::get_language_count(); i++) {
+		script_extensions.insert(ScriptServer::get_language(i)->get_extension().to_lower());
+	}
 
 	// This loads the global class names from the scripts and ensures that even if the
 	// global_script_class_cache.cfg was missing or invalid, the global class names are valid in ScriptServer.
 	// At the same time, to prevent looping multiple times in all files, it looks for extensions.
 	ep.step(TTR("Loading global class names..."), 1, true);
-	_first_scan_process_scripts(first_scan_root_dir, gdextension_extensions, existing_class_names, extensions);
+	_first_scan_process_scripts(first_scan_root_dir, gdextension_extensions, script_extensions, existing_class_names, extensions);
 
 	// Removing invalid global class to prevent having invalid paths in ScriptServer.
 	bool save_scripts = _remove_invalid_global_class_names(existing_class_names);
@@ -362,9 +372,9 @@ void EditorFileSystem::_first_scan_filesystem() {
 	ep.step(TTR("Starting file scan..."), 5, true);
 }
 
-void EditorFileSystem::_first_scan_process_scripts(const ScannedDirectory *p_scan_dir, List<String> &p_gdextension_extensions, HashSet<String> &p_existing_class_names, HashSet<String> &p_extensions) {
+void EditorFileSystem::_first_scan_process_scripts(const ScannedDirectory *p_scan_dir, const HashSet<String> &p_gdextension_extensions, const HashSet<String> &p_script_extensions, HashSet<String> &p_existing_class_names, HashSet<String> &p_extensions) {
 	for (ScannedDirectory *scan_sub_dir : p_scan_dir->subdirs) {
-		_first_scan_process_scripts(scan_sub_dir, p_gdextension_extensions, p_existing_class_names, p_extensions);
+		_first_scan_process_scripts(scan_sub_dir, p_gdextension_extensions, p_script_extensions, p_existing_class_names, p_extensions);
 	}
 
 	for (const String &scan_file : p_scan_dir->files) {
@@ -372,13 +382,7 @@ void EditorFileSystem::_first_scan_process_scripts(const ScannedDirectory *p_sca
 		// that are not scripts. Some loader get_resource_type methods read the file
 		// which can be very slow on large projects.
 		const String ext = scan_file.get_extension().to_lower();
-		bool is_script = false;
-		for (int i = 0; i < ScriptServer::get_language_count(); i++) {
-			if (ScriptServer::get_language(i)->get_extension() == ext) {
-				is_script = true;
-				break;
-			}
-		}
+		const bool is_script = p_script_extensions.has(ext);
 		if (is_script) {
 			const String path = p_scan_dir->full_path.path_join(scan_file);
 			const String type = ResourceLoader::get_resource_type(path);
@@ -396,7 +400,7 @@ void EditorFileSystem::_first_scan_process_scripts(const ScannedDirectory *p_sca
 		}
 
 		// Check for GDExtensions.
-		if (p_gdextension_extensions.find(ext)) {
+		if (p_gdextension_extensions.has(ext)) {
 			const String path = p_scan_dir->full_path.path_join(scan_file);
 			const String type = ResourceLoader::get_resource_type(path);
 			if (type == SNAME("GDExtension")) {
@@ -582,13 +586,12 @@ bool EditorFileSystem::_is_test_for_reimport_needed(const String &p_path, uint64
 }
 
 bool EditorFileSystem::_test_for_reimport(const String &p_path, const String &p_expected_import_md5) {
-	if (p_expected_import_md5.is_empty()) {
-		// Marked as reimportation needed.
-		return true;
-	}
-	String new_md5 = FileAccess::get_md5(p_path + ".import");
-	if (p_expected_import_md5 != new_md5) {
-		return true;
+	const bool has_cached_import_md5 = !p_expected_import_md5.is_empty();
+	if (has_cached_import_md5) {
+		String new_md5 = FileAccess::get_md5(p_path + ".import");
+		if (p_expected_import_md5 != new_md5) {
+			return true;
+		}
 	}
 
 	Error err;
@@ -692,6 +695,26 @@ bool EditorFileSystem::_test_for_reimport(const String &p_path, const String &p_
 	if (!importer->are_import_settings_valid(p_path, meta)) {
 		// Reimport settings are out of sync with project settings, reimport.
 		return true;
+	}
+
+	if (!has_cached_import_md5) {
+		// Fast path used when no cache md5 is available (e.g. first scan with missing cache):
+		// avoid hashing large source/output files and rely on timestamps + existence checks.
+		const uint64_t source_mtime = FileAccess::get_modified_time(p_path);
+		const uint64_t import_mtime = FileAccess::get_modified_time(p_path + ".import");
+		if (source_mtime > import_mtime) {
+			return true;
+		}
+
+		if (reimport_on_missing_imported_files) {
+			for (const String &dest_file : dest_files) {
+				if (!FileAccess::exists(dest_file)) {
+					return true;
+				}
+			}
+		}
+
+		return false;
 	}
 
 	// Read the md5's from a separate file (so the import parameters aren't dependent on the file version).
@@ -992,7 +1015,7 @@ bool EditorFileSystem::_update_scan_actions() {
 					Vector<String> dependencies = _get_dependencies(full_path);
 					for (const String &dep : dependencies) {
 						const String &dependency_path = dep.contains("::") ? dep.get_slice("::", 0) : dep;
-						if (_can_import_file(dep)) {
+						if (_can_import_file(dependency_path)) {
 							reimports.push_back(dependency_path);
 						}
 					}
@@ -1136,7 +1159,7 @@ void EditorFileSystem::scan() {
 		Thread::Settings s;
 		scanning = true;
 		scan_total = 0;
-		s.priority = Thread::PRIORITY_LOW;
+		s.priority = Thread::PRIORITY_NORMAL;
 		thread.start(_thread_func, this, s);
 	}
 }
@@ -1732,7 +1755,7 @@ void EditorFileSystem::scan_changes() {
 		set_process(true);
 		scan_total = 0;
 		Thread::Settings s;
-		s.priority = Thread::PRIORITY_LOW;
+		s.priority = Thread::PRIORITY_NORMAL;
 		thread_sources.start(_thread_func_sources, this, s);
 	}
 }
@@ -2087,6 +2110,10 @@ Vector<String> EditorFileSystem::_get_dependencies(const String &p_path) {
 
 EditorFileSystem::ScriptClassInfo EditorFileSystem::_get_global_script_class(const String &p_type, const String &p_path) const {
 	ScriptClassInfo info;
+	if (!ClassDB::is_parent_class(p_type, SNAME("Script"))) {
+		return info;
+	}
+
 	for (int i = 0; i < ScriptServer::get_language_count(); i++) {
 		if (ScriptServer::get_language(i)->handles_global_class_type(p_type)) {
 			info.name = ScriptServer::get_language(i)->get_global_class_name(p_path, &info.extends, &info.icon_path, &info.is_abstract, &info.is_tool);
@@ -3108,7 +3135,15 @@ void EditorFileSystem::reimport_file_with_custom_parameters(const String &p_file
 	// Emit the resource_reimporting signal for the single file before the actual importation.
 	emit_signal(SNAME("resources_reimporting"), reloads);
 
-	_reimport_file(p_file, p_custom_params, p_importer);
+	const uint64_t start_time = OS::get_singleton()->get_ticks_msec();
+	Error import_error = _reimport_file(p_file, p_custom_params, p_importer);
+	const uint64_t duration_ms = OS::get_singleton()->get_ticks_msec() - start_time;
+	int worker_thread_pool_size = 1;
+#if defined(THREADS_ENABLED)
+	worker_thread_pool_size = MAX(1, WorkerThreadPool::get_singleton()->get_thread_count());
+#endif
+	_record_import_timing(p_file, p_importer, "asset", duration_ms, false, import_error, 1, worker_thread_pool_size, 1);
+	_flush_import_timing_csv();
 
 	// Emit the resource_reimported signal for the single file we just reimported.
 	emit_signal(SNAME("resources_reimported"), reloads);
@@ -3236,10 +3271,85 @@ void EditorFileSystem::_refresh_filesystem() {
 	refresh_queued = false;
 }
 
+void EditorFileSystem::_record_import_timing(const String &p_file, const String &p_importer, const String &p_phase, uint64_t p_duration_ms, bool p_threaded, Error p_result, int p_threads_used, int p_thread_pool_size, int p_batch_size) {
+	ImportTimingEntry entry;
+	entry.unix_time_ms = uint64_t(OS::get_singleton()->get_unix_time() * 1000.0);
+	entry.duration_ms = p_duration_ms;
+	entry.thread_id = Thread::get_caller_id();
+	entry.file = p_file;
+	entry.importer = p_importer;
+	entry.phase = p_phase;
+	entry.result = p_result;
+	entry.threaded = p_threaded;
+	entry.threads_used = MAX(1, p_threads_used);
+	entry.thread_pool_size = MAX(1, p_thread_pool_size);
+	entry.batch_size = MAX(1, p_batch_size);
+
+	MutexLock lock(import_timing_mutex);
+	import_timing_entries.push_back(entry);
+}
+
+void EditorFileSystem::_flush_import_timing_csv() {
+	Vector<ImportTimingEntry> pending_entries;
+	{
+		MutexLock lock(import_timing_mutex);
+		if (import_timing_entries.is_empty()) {
+			return;
+		}
+		pending_entries = import_timing_entries;
+		import_timing_entries.clear();
+	}
+
+	const String csv_path = EditorPaths::get_singleton()->get_project_settings_dir().path_join("import_asset_timings.csv");
+	const bool file_exists = FileAccess::exists(csv_path);
+	Ref<FileAccess> csv_file = FileAccess::open(csv_path, file_exists ? FileAccess::READ_WRITE : FileAccess::WRITE_READ);
+	ERR_FAIL_COND_MSG(csv_file.is_null(), vformat("Cannot write import timing CSV '%s'.", csv_path));
+
+	if (file_exists && csv_file->get_length() > 0) {
+		csv_file->seek_end();
+	} else {
+		Vector<String> header;
+		header.push_back("unix_time_ms");
+		header.push_back("duration_ms");
+		header.push_back("threaded");
+		header.push_back("result_code");
+		header.push_back("importer");
+		header.push_back("phase");
+		header.push_back("threads_used");
+		header.push_back("thread_pool_size");
+		header.push_back("batch_size");
+		header.push_back("thread_id");
+		header.push_back("asset_path");
+		csv_file->store_csv_line(header);
+	}
+
+	for (const ImportTimingEntry &entry : pending_entries) {
+		Vector<String> row;
+		row.push_back(itos((int64_t)entry.unix_time_ms));
+		row.push_back(itos((int64_t)entry.duration_ms));
+		row.push_back(entry.threaded ? "1" : "0");
+		row.push_back(itos((int)entry.result));
+		row.push_back(entry.importer);
+		row.push_back(entry.phase);
+		row.push_back(itos(entry.threads_used));
+		row.push_back(itos(entry.thread_pool_size));
+		row.push_back(itos(entry.batch_size));
+		row.push_back(itos((int64_t)entry.thread_id));
+		row.push_back(entry.file);
+		csv_file->store_csv_line(row);
+	}
+	csv_file->flush();
+}
+
 void EditorFileSystem::_reimport_thread(uint32_t p_index, ImportThreadData *p_import_data) {
 	ResourceLoader::set_is_import_thread(true);
 	int file_idx = p_import_data->reimport_from + int(p_index);
-	_reimport_file(p_import_data->reimport_files[file_idx].path);
+	const ImportFile &import_file = p_import_data->reimport_files[file_idx];
+	_record_import_timing(import_file.path, import_file.importer, "asset_start", 0, true, OK, p_import_data->threads_used, p_import_data->thread_pool_size, p_import_data->batch_size);
+	const uint64_t start_time = OS::get_singleton()->get_ticks_msec();
+	Error import_error = _reimport_file(import_file.path);
+	const uint64_t duration_ms = OS::get_singleton()->get_ticks_msec() - start_time;
+	_record_import_timing(import_file.path, import_file.importer, "asset", duration_ms, true, import_error, p_import_data->threads_used, p_import_data->thread_pool_size, p_import_data->batch_size);
 	ResourceLoader::set_is_import_thread(false);
 
 	p_import_data->imported_sem->post();
@@ -3250,6 +3360,8 @@ void EditorFileSystem::reimport_files(const Vector<String> &p_files) {
 	importing = true;
 
 	Vector<String> reloads;
+	constexpr int PREPARE_PROGRESS_STEP_INTERVAL = 32;
+	constexpr int IMPORT_PROGRESS_STEP_INTERVAL = 1;
 
 	EditorProgress *ep = memnew(EditorProgress("reimport", TTR("(Re)Importing Assets"), p_files.size()));
 
@@ -3268,7 +3380,9 @@ void EditorFileSystem::reimport_files(const Vector<String> &p_files) {
 	HashSet<String> groups_to_reimport;
 
 	for (int i = 0; i < p_files.size(); i++) {
-		ep->step(TTR("Preparing files to reimport..."), i, false);
+		if (i == 0 || ((i + 1) % PREPARE_PROGRESS_STEP_INTERVAL) == 0 || i + 1 == p_files.size()) {
+			ep->step(TTR("Preparing files to reimport..."), i, false);
+		}
 
 		String file = p_files[i];
 
@@ -3294,7 +3408,23 @@ void EditorFileSystem::reimport_files(const Vector<String> &p_files) {
 			// It's a regular file.
 			ImportFile ifile;
 			ifile.path = file;
-			ResourceFormatImporter::get_singleton()->get_import_order_threads_and_importer(file, ifile.order, ifile.threaded, ifile.importer);
+			Error importer_info_err = ResourceFormatImporter::get_singleton()->get_import_order_threads_and_importer(file, ifile.order, ifile.threaded, ifile.importer);
+			if (importer_info_err != OK || ifile.importer.is_empty()) {
+				Ref<ResourceImporter> importer = ResourceFormatImporter::get_singleton()->get_importer_by_file(file);
+				if (importer.is_valid()) {
+					ifile.order = importer->get_import_order();
+					ifile.threaded = importer->can_import_threaded();
+					ifile.importer = importer->get_importer_name();
+				}
+			}
+			if (ifile.importer.is_empty()) {
+				// Keep a non-empty marker for diagnostics and deterministic sort/group behavior.
+				ifile.importer = "<unresolved>";
+			}
+			// Scene importer path is not safe to run on worker threads (touches editor/main-thread systems).
+			if (ifile.importer == "scene" || ifile.importer == "animation_library" || ifile.importer == "ArrayMesh" || ifile.importer == "MeshLibrary") {
+				ifile.threaded = false;
+			}
 			reloads.push_back(file);
 			reimport_files.push_back(ifile);
 		}
@@ -3325,6 +3455,11 @@ void EditorFileSystem::reimport_files(const Vector<String> &p_files) {
 	bool use_multiple_threads = false;
 #endif
 
+	int worker_thread_pool_size = 1;
+#if defined(THREADS_ENABLED)
+	worker_thread_pool_size = MAX(1, WorkerThreadPool::get_singleton()->get_thread_count());
+#endif
+
 	int from = 0;
 	Semaphore imported_sem;
 	for (int i = 0; i < reimport_files.size(); i++) {
@@ -3338,7 +3473,12 @@ void EditorFileSystem::reimport_files(const Vector<String> &p_files) {
 				if (from - i == 0) {
 					// Single file, do not use threads.
 					ep->step(reimport_files[i].path.get_file(), i, false);
-					_reimport_file(reimport_files[i].path);
+					_record_import_timing(reimport_files[i].path, reimport_files[i].importer, "asset_start", 0, false, OK, 1, worker_thread_pool_size, 1);
+					_flush_import_timing_csv();
+					const uint64_t start_time = OS::get_singleton()->get_ticks_msec();
+					Error import_error = _reimport_file(reimport_files[i].path);
+					const uint64_t duration_ms = OS::get_singleton()->get_ticks_msec() - start_time;
+					_record_import_timing(reimport_files[i].path, reimport_files[i].importer, "asset", duration_ms, false, import_error, 1, worker_thread_pool_size, 1);
 				} else {
 					Ref<ResourceImporter> importer = ResourceFormatImporter::get_singleton()->get_importer_by_name(reimport_files[from].importer);
 					if (importer.is_null()) {
@@ -3353,22 +3493,34 @@ void EditorFileSystem::reimport_files(const Vector<String> &p_files) {
 					tdata.reimport_from = from;
 					tdata.reimport_files = reimport_files.ptr();
 					tdata.imported_sem = &imported_sem;
-
 					int item_count = i - from + 1;
-					WorkerThreadPool::GroupID group_task = WorkerThreadPool::get_singleton()->add_template_group_task(this, &EditorFileSystem::_reimport_thread, &tdata, item_count, -1, false, vformat(TTR("Import resources of type: %s"), reimport_files[from].importer));
+					tdata.thread_pool_size = worker_thread_pool_size;
+					tdata.batch_size = item_count;
+					const int importer_worker_limit = MAX(1, worker_thread_pool_size - 1);
+					tdata.threads_used = MIN(item_count, importer_worker_limit);
+					print_line(vformat("Reimport batch \"%s\": assets=%d, workers=%d/%d", reimport_files[from].importer, item_count, tdata.threads_used, tdata.thread_pool_size));
+					WorkerThreadPool::GroupID group_task = WorkerThreadPool::get_singleton()->add_template_group_task(this, &EditorFileSystem::_reimport_thread, &tdata, item_count, tdata.threads_used, false, vformat(TTR("Import resources of type: %s"), reimport_files[from].importer));
 
 					int imported_count = 0;
-					while (true) {
-						while (true) {
-							ep->step(reimport_files[imported_count].path.get_file(), from + imported_count, false);
-							if (imported_sem.try_wait()) {
-								imported_count++;
-								break;
+					uint64_t last_wait_log_msec = OS::get_singleton()->get_ticks_msec();
+					while (imported_count < item_count) {
+						if (imported_sem.try_wait()) {
+							if (imported_count == 0 || ((imported_count + 1) % IMPORT_PROGRESS_STEP_INTERVAL) == 0 || imported_count + 1 == item_count) {
+								ep->step(reimport_files[from + imported_count].path.get_file(), from + imported_count, false);
 							}
+							imported_count++;
+							continue;
 						}
-						if (imported_count == item_count) {
-							break;
+
+						const uint64_t now_msec = OS::get_singleton()->get_ticks_msec();
+						if (now_msec - last_wait_log_msec >= 1000) {
+							const int active_index = MIN(from + imported_count, i);
+							ep->step(vformat(TTR("Importing %s... (%d/%d)"), reimport_files[active_index].path.get_file(), imported_count, item_count), active_index, true);
+							_flush_import_timing_csv();
+							last_wait_log_msec = now_msec;
 						}
+
+						OS::get_singleton()->delay_usec(1000);
 					}
 
 					WorkerThreadPool::get_singleton()->wait_for_group_task_completion(group_task);
@@ -3381,8 +3533,15 @@ void EditorFileSystem::reimport_files(const Vector<String> &p_files) {
 			}
 
 		} else {
-			ep->step(reimport_files[i].path.get_file(), i, false);
-			_reimport_file(reimport_files[i].path);
+			if (i == 0 || ((i + 1) % IMPORT_PROGRESS_STEP_INTERVAL) == 0 || i + 1 == reimport_files.size()) {
+				ep->step(reimport_files[i].path.get_file(), i, false);
+			}
+			_record_import_timing(reimport_files[i].path, reimport_files[i].importer, "asset_start", 0, false, OK, 1, worker_thread_pool_size, 1);
+			_flush_import_timing_csv();
+			const uint64_t start_time = OS::get_singleton()->get_ticks_msec();
+			Error import_error = _reimport_file(reimport_files[i].path);
+			const uint64_t duration_ms = OS::get_singleton()->get_ticks_msec() - start_time;
+			_record_import_timing(reimport_files[i].path, reimport_files[i].importer, "asset", duration_ms, false, import_error, 1, worker_thread_pool_size, 1);
 
 			// We need to increment the counter, maybe the next file is multithreaded
 			// and doesn't have the same importer.
@@ -3399,11 +3558,21 @@ void EditorFileSystem::reimport_files(const Vector<String> &p_files) {
 		_find_group_files(filesystem, group_files, groups_to_reimport);
 		for (const KeyValue<String, Vector<String>> &E : group_files) {
 			ep->step(E.key.get_file(), from++, false);
+			const uint64_t group_start_time = OS::get_singleton()->get_ticks_msec();
 			Error err = _reimport_group(E.key, E.value);
+			const uint64_t group_duration_ms = OS::get_singleton()->get_ticks_msec() - group_start_time;
+			for (const String &group_asset_path : E.value) {
+				_record_import_timing(group_asset_path, "group_import", "group_asset", group_duration_ms, false, err, 1, worker_thread_pool_size, E.value.size());
+			}
 			reloads.push_back(E.key);
 			reloads.append_array(E.value);
 			if (err == OK) {
-				_reimport_file(E.key);
+				const uint64_t start_time = OS::get_singleton()->get_ticks_msec();
+				Error import_error = _reimport_file(E.key);
+				const uint64_t duration_ms = OS::get_singleton()->get_ticks_msec() - start_time;
+				_record_import_timing(E.key, "group_import", "group_file", duration_ms, false, import_error, 1, worker_thread_pool_size, 1);
+			} else {
+				_record_import_timing(E.key, "group_import", "group_file", group_duration_ms, false, err, 1, worker_thread_pool_size, 1);
 			}
 		}
 	}
@@ -3411,6 +3580,7 @@ void EditorFileSystem::reimport_files(const Vector<String> &p_files) {
 
 	ResourceUID::get_singleton()->update_cache(); // After reimporting, update the cache.
 	_save_filesystem_cache();
+	_flush_import_timing_csv();
 
 	memdelete(ep);
 
@@ -3438,7 +3608,18 @@ Error EditorFileSystem::reimport_append(const String &p_file, const HashMap<Stri
 	// Emit the resource_reimporting signal for the single file before the actual importation.
 	emit_signal(SNAME("resources_reimporting"), reloads);
 
+	int worker_thread_pool_size = 1;
+#if defined(THREADS_ENABLED)
+	worker_thread_pool_size = MAX(1, WorkerThreadPool::get_singleton()->get_thread_count());
+#endif
+	const String importer_name = p_custom_importer.is_empty() ? String("<custom_or_auto>") : p_custom_importer;
+	_record_import_timing(p_file, importer_name, "asset_start", 0, false, OK, 1, worker_thread_pool_size, 1);
+	_flush_import_timing_csv();
+	const uint64_t start_time = OS::get_singleton()->get_ticks_msec();
 	Error ret = _reimport_file(p_file, p_custom_options, p_custom_importer, &p_generator_parameters);
+	const uint64_t duration_ms = OS::get_singleton()->get_ticks_msec() - start_time;
+	_record_import_timing(p_file, importer_name, "asset", duration_ms, false, ret, 1, worker_thread_pool_size, 1);
+	_flush_import_timing_csv();
 
 	// Emit the resource_reimported signal for the single file we just reimported.
 	emit_signal(SNAME("resources_reimported"), reloads);
@@ -3767,13 +3948,11 @@ void EditorFileSystem::_update_extensions() {
 }
 
 bool EditorFileSystem::_can_import_file(const String &p_file) {
-	for (const String &F : import_extensions) {
-		if (p_file.right(F.length()).nocasecmp_to(F) == 0) {
-			return true;
-		}
+	const String ext = p_file.get_extension().to_lower();
+	if (ext.is_empty()) {
+		return false;
 	}
-
-	return false;
+	return import_extensions.has("." + ext);
 }
 
 void EditorFileSystem::add_import_format_support_query(Ref<EditorFileSystemImportFormatSupportQuery> p_query) {

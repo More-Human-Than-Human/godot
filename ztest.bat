@@ -1,0 +1,1 @@
+@echo off`r`necho hello`r`n

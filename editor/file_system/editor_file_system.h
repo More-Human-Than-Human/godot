@@ -195,7 +195,7 @@ class EditorFileSystem : public Node {
 	void _notify_filesystem_changed();
 	void _scan_filesystem();
 	void _first_scan_filesystem();
-	void _first_scan_process_scripts(const ScannedDirectory *p_scan_dir, List<String> &p_gdextension_extensions, HashSet<String> &p_existing_class_names, HashSet<String> &p_extensions);
+	void _first_scan_process_scripts(const ScannedDirectory *p_scan_dir, const HashSet<String> &p_gdextension_extensions, const HashSet<String> &p_script_extensions, HashSet<String> &p_existing_class_names, HashSet<String> &p_extensions);
 
 	static void _scan_for_uid_directory(const ScannedDirectory *p_scan_dir, const HashSet<String> &p_import_extensions);
 
@@ -355,7 +355,29 @@ class EditorFileSystem : public Node {
 		const ImportFile *reimport_files;
 		int reimport_from;
 		Semaphore *imported_sem = nullptr;
+		int thread_pool_size = 1;
+		int threads_used = 1;
+		int batch_size = 1;
 	};
+
+	struct ImportTimingEntry {
+		uint64_t unix_time_ms = 0;
+		uint64_t duration_ms = 0;
+		Thread::ID thread_id = Thread::UNASSIGNED_ID;
+		String file;
+		String importer;
+		String phase;
+		Error result = OK;
+		bool threaded = false;
+		int threads_used = 1;
+		int thread_pool_size = 1;
+		int batch_size = 1;
+	};
+
+	Mutex import_timing_mutex;
+	Vector<ImportTimingEntry> import_timing_entries;
+	void _record_import_timing(const String &p_file, const String &p_importer, const String &p_phase, uint64_t p_duration_ms, bool p_threaded, Error p_result, int p_threads_used = 1, int p_thread_pool_size = 1, int p_batch_size = 1);
+	void _flush_import_timing_csv();
 
 	void _reimport_thread(uint32_t p_index, ImportThreadData *p_import_data);
 

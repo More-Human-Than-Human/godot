@@ -15,6 +15,7 @@ from types import ModuleType
 
 from SCons import __version__ as scons_raw_version
 from SCons.Builder import ListEmitter
+from SCons.Script import BUILD_TARGETS, COMMAND_LINE_TARGETS
 
 # Explicitly resolve the helper modules, this is done to avoid clash with
 # modules of the same name that might be randomly added (e.g. someone adding
@@ -1241,6 +1242,21 @@ if env["tests"]:
 SConscript("main/SCsub")
 
 SConscript("platform/" + env["platform"] + "/SCsub")  # Build selected platform.
+
+# Compile direct source targets without building the final program.
+source_suffixes = (".c", ".cc", ".cpp", ".cxx", ".m", ".mm", ".s", ".S")
+for target in list(COMMAND_LINE_TARGETS):
+    if not target.endswith(source_suffixes):
+        continue
+
+    source = env.File(target)
+    if not source.exists():
+        continue
+
+    object_target = env.Object(source)[0]
+    COMMAND_LINE_TARGETS.remove(target)
+    BUILD_TARGETS.remove(target)
+    BUILD_TARGETS.append(object_target)
 
 # Microsoft Visual Studio Project Generation
 if env["vsproj"]:
