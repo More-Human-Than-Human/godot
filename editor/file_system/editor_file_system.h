@@ -273,7 +273,7 @@ class EditorFileSystem : public Node {
 
 	void _update_extensions();
 
-	Error _reimport_file(const String &p_file, const HashMap<StringName, Variant> &p_custom_options = HashMap<StringName, Variant>(), const String &p_custom_importer = String(), Variant *generator_parameters = nullptr, bool p_update_file_system = true);
+	Error _reimport_file(const String &p_file, const HashMap<StringName, Variant> &p_custom_options = HashMap<StringName, Variant>(), const String &p_custom_importer = String(), Variant *generator_parameters = nullptr, bool p_update_file_system = true, bool p_defer_shared_state = false);
 	Error _reimport_group(const String &p_group_file, const Vector<String> &p_files);
 
 	bool _test_for_reimport(const String &p_path, const String &p_expected_import_md5);
@@ -406,6 +406,7 @@ class EditorFileSystem : public Node {
 	void _queue_import_work_result(const ImportWorkResult &p_result);
 	bool _pop_import_work_result(ImportWorkResult &r_result);
 	void _clear_import_work_results();
+	void _commit_import_work_result(const ImportWorkResult &p_result);
 
 	void _reimport_thread(uint32_t p_index, ImportThreadData *p_import_data);
 

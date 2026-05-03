@@ -2823,7 +2823,7 @@ Error EditorFileSystem::_reimport_group(const String &p_group_file, const Vector
 	return err;
 }
 
-Error EditorFileSystem::_reimport_file(const String &p_file, const HashMap<StringName, Variant> &p_custom_options, const String &p_custom_importer, Variant *p_generator_parameters, bool p_update_file_system) {
+Error EditorFileSystem::_reimport_file(const String &p_file, const HashMap<StringName, Variant> &p_custom_options, const String &p_custom_importer, Variant *p_generator_parameters, bool p_update_file_system, bool p_defer_shared_state) {
 	print_verbose(vformat("EditorFileSystem: Importing file: %s", p_file));
 	uint64_t start_time = OS::get_singleton()->get_ticks_msec();
 
@@ -3079,31 +3079,33 @@ Error EditorFileSystem::_reimport_file(const String &p_file, const HashMap<Strin
 		fs->files[cpos]->import_valid = fs->files[cpos]->type == "TextFile" ? true : ResourceLoader::is_import_valid(p_file);
 	}
 
-	for (const String &path : gen_files) {
-		Ref<Resource> cached = ResourceCache::get_ref(path);
-		if (cached.is_valid()) {
-			cached->reload_from_file();
+	if (!p_defer_shared_state) {
+		for (const String &path : gen_files) {
+			Ref<Resource> cached = ResourceCache::get_ref(path);
+			if (cached.is_valid()) {
+				cached->reload_from_file();
+			}
 		}
-	}
 
-	if (ResourceUID::get_singleton()->has_id(uid)) {
-		ResourceUID::get_singleton()->set_id(uid, p_file);
-	} else {
-		ResourceUID::get_singleton()->add_id(uid, p_file);
-	}
-
-	// If file is currently up, maybe the source it was loaded from changed, so import math must be updated for it
-	// to reload properly.
-	Ref<Resource> r = ResourceCache::get_ref(p_file);
-	if (r.is_valid()) {
-		if (!r->get_import_path().is_empty()) {
-			String dst_path = ResourceFormatImporter::get_singleton()->get_internal_resource_path(p_file);
-			r->set_import_path(dst_path);
-			r->set_import_last_modified_time(0);
+		if (ResourceUID::get_singleton()->has_id(uid)) {
+			ResourceUID::get_singleton()->set_id(uid, p_file);
+		} else {
+			ResourceUID::get_singleton()->add_id(uid, p_file);
 		}
-	}
 
-	EditorResourcePreview::get_singleton()->check_for_invalidation(p_file);
+		// If file is currently up, maybe the source it was loaded from changed, so import math must be updated for it
+		// to reload properly.
+		Ref<Resource> r = ResourceCache::get_ref(p_file);
+		if (r.is_valid()) {
+			if (!r->get_import_path().is_empty()) {
+				String dst_path = ResourceFormatImporter::get_singleton()->get_internal_resource_path(p_file);
+				r->set_import_path(dst_path);
+				r->set_import_last_modified_time(0);
+			}
+		}
+
+		EditorResourcePreview::get_singleton()->check_for_invalidation(p_file);
+	}
 
 	print_verbose(vformat("EditorFileSystem: \"%s\" import took %d ms.", p_file, OS::get_singleton()->get_ticks_msec() - start_time));
 
@@ -3361,13 +3363,74 @@ void EditorFileSystem::_clear_import_work_results() {
 	import_work_results.clear();
 }
 
+void EditorFileSystem::_commit_import_work_result(const ImportWorkResult &p_result) {
+	const String &file = p_result.path;
+	EditorFileSystemDirectory *fs = nullptr;
+	int cpos = -1;
+	if (!_find_file(file, &fs, cpos)) {
+		return;
+	}
+
+	Vector<String> dest_paths = _get_import_dest_paths(file);
+	Vector<String> deps = _get_dependencies(file);
+	const String resource_type = ResourceLoader::get_resource_type(file);
+	const String resource_script_class = ResourceLoader::get_resource_script_class(file);
+	ResourceUID::ID uid = ResourceUID::INVALID_ID;
+
+	if (FileAccess::exists(file + ".import")) {
+		Ref<ConfigFile> cfg;
+		cfg.instantiate();
+		if (cfg->load(file + ".import") == OK && cfg->has_section_key("remap", "uid")) {
+			uid = ResourceUID::get_singleton()->text_to_id(cfg->get_value("remap", "uid"));
+		}
+	}
+
+	if (uid == ResourceUID::INVALID_ID) {
+		uid = ResourceUID::get_singleton()->create_id_for_path(file);
+	}
+
+	fs->files[cpos]->modified_time = FileAccess::get_modified_time(file);
+	fs->files[cpos]->import_modified_time = FileAccess::get_modified_time(file + ".import");
+	fs->files[cpos]->import_md5 = FileAccess::get_md5(file + ".import");
+	fs->files[cpos]->import_dest_paths = dest_paths;
+	fs->files[cpos]->deps = deps;
+	fs->files[cpos]->type = resource_type;
+	fs->files[cpos]->resource_script_class = resource_script_class;
+	fs->files[cpos]->uid = uid;
+	fs->files[cpos]->import_valid = fs->files[cpos]->type == "TextFile" ? true : ResourceLoader::is_import_valid(file);
+
+	for (const String &path : dest_paths) {
+		Ref<Resource> cached = ResourceCache::get_ref(path);
+		if (cached.is_valid()) {
+			cached->reload_from_file();
+		}
+	}
+
+	if (ResourceUID::get_singleton()->has_id(uid)) {
+		ResourceUID::get_singleton()->set_id(uid, file);
+	} else {
+		ResourceUID::get_singleton()->add_id(uid, file);
+	}
+
+	Ref<Resource> r = ResourceCache::get_ref(file);
+	if (r.is_valid()) {
+		if (!r->get_import_path().is_empty()) {
+			String dst_path = ResourceFormatImporter::get_singleton()->get_internal_resource_path(file);
+			r->set_import_path(dst_path);
+			r->set_import_last_modified_time(0);
+		}
+	}
+
+	EditorResourcePreview::get_singleton()->check_for_invalidation(file);
+}
+
 void EditorFileSystem::_reimport_thread(uint32_t p_index, ImportThreadData *p_import_data) {
 	ResourceLoader::set_is_import_thread(true);
 	int file_idx = p_import_data->reimport_from + int(p_index);
 	const ImportFile &import_file = p_import_data->reimport_files[file_idx];
 	_record_import_timing(import_file.path, import_file.importer, "asset_start", 0, true, OK, p_import_data->threads_used, p_import_data->thread_pool_size, p_import_data->batch_size);
 	const uint64_t start_time = OS::get_singleton()->get_ticks_msec();
-	Error import_error = _reimport_file(import_file.path);
+	Error import_error = _reimport_file(import_file.path, HashMap<StringName, Variant>(), String(), nullptr, false, true);
 	const uint64_t duration_ms = OS::get_singleton()->get_ticks_msec() - start_time;
 	_record_import_timing(import_file.path, import_file.importer, "asset", duration_ms, true, import_error, p_import_data->threads_used, p_import_data->thread_pool_size, p_import_data->batch_size);
 
@@ -3541,6 +3604,12 @@ void EditorFileSystem::reimport_files(const Vector<String> &p_files) {
 						if (imported_sem.try_wait()) {
 							ImportWorkResult completed_result;
 							const bool has_result = _pop_import_work_result(completed_result);
+							if (!has_result) {
+								completed_result.path = reimport_files[from + imported_count].path;
+								completed_result.importer = reimport_files[from + imported_count].importer;
+								completed_result.error = ERR_BUG;
+							}
+							_commit_import_work_result(completed_result);
 							const String completed_label = has_result ? completed_result.path.get_file() : reimport_files[from + imported_count].path.get_file();
 							if (imported_count == 0 || ((imported_count + 1) % IMPORT_PROGRESS_STEP_INTERVAL) == 0 || imported_count + 1 == item_count) {
 								ep->step(completed_label, from + imported_count, false);
@@ -3565,6 +3634,7 @@ void EditorFileSystem::reimport_files(const Vector<String> &p_files) {
 					ImportWorkResult remaining_result;
 					while (_pop_import_work_result(remaining_result)) {
 						// Drain any remaining work results from the queue for the next batch.
+						_commit_import_work_result(remaining_result);
 					}
 
 					importer->import_threaded_end();
