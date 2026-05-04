@@ -103,6 +103,10 @@ struct ImportScratchStack {
 
 static thread_local ImportScratchStack import_scratch_stack;
 
+static bool _is_import_timing_csv_enabled() {
+	return bool(GLOBAL_DEF("editor/import/experimental/write_import_timing_csv", false));
+}
+
 class ImportScratchScope {
 	ImportScratchArena *arena = nullptr;
 
@@ -3345,6 +3349,10 @@ void EditorFileSystem::_refresh_filesystem() {
 }
 
 void EditorFileSystem::_record_import_timing(const String &p_file, const String &p_importer, const String &p_phase, uint64_t p_duration_ms, bool p_threaded, Error p_result, int p_threads_used, int p_thread_pool_size, int p_batch_size) {
+	if (!_is_import_timing_csv_enabled()) {
+		return;
+	}
+
 	ImportTimingEntry entry;
 	entry.unix_time_ms = uint64_t(OS::get_singleton()->get_unix_time() * 1000.0);
 	entry.duration_ms = p_duration_ms;
@@ -3363,6 +3371,12 @@ void EditorFileSystem::_record_import_timing(const String &p_file, const String 
 }
 
 void EditorFileSystem::_flush_import_timing_csv() {
+	if (!_is_import_timing_csv_enabled()) {
+		MutexLock lock(import_timing_mutex);
+		import_timing_entries.clear();
+		return;
+	}
+
 	Vector<ImportTimingEntry> pending_entries;
 	{
 		MutexLock lock(import_timing_mutex);
