@@ -60,6 +60,68 @@ EditorFileSystem::ScannedDirectory *EditorFileSystem::first_scan_root_dir = null
 //the name is the version, to keep compatibility with different versions of Godot
 #define CACHE_FILE_NAME "filesystem_cache10"
 
+namespace {
+
+struct ImportScratchArena {
+	HashMap<StringName, Variant> params;
+	List<ResourceImporter::ImportOption> opts;
+	List<String> import_variants;
+	List<String> gen_files;
+	Vector<String> dest_paths;
+	Array gen_files_array;
+	Array dest_files_array;
+
+	void reset() {
+		params.clear();
+		opts.clear();
+		import_variants.clear();
+		gen_files.clear();
+		dest_paths.clear();
+		gen_files_array.clear();
+		dest_files_array.clear();
+	}
+};
+
+struct ImportScratchStack {
+	LocalVector<ImportScratchArena *> arenas;
+	int depth = 0;
+
+	ImportScratchArena *acquire() {
+		if (depth >= int(arenas.size())) {
+			arenas.push_back(memnew(ImportScratchArena));
+		}
+		ImportScratchArena *arena = arenas[depth++];
+		arena->reset();
+		return arena;
+	}
+
+	void release() {
+		ERR_FAIL_COND(depth <= 0);
+		depth--;
+	}
+};
+
+static thread_local ImportScratchStack import_scratch_stack;
+
+class ImportScratchScope {
+	ImportScratchArena *arena = nullptr;
+
+public:
+	ImportScratchScope() {
+		arena = import_scratch_stack.acquire();
+	}
+
+	~ImportScratchScope() {
+		import_scratch_stack.release();
+	}
+
+	ImportScratchArena *get() const {
+		return arena;
+	}
+};
+
+} // namespace
+
 int EditorFileSystemDirectory::find_file_index(const String &p_file) const {
 	for (int i = 0; i < files.size(); i++) {
 		if (files[i]->file == p_file) {
@@ -2826,6 +2888,8 @@ Error EditorFileSystem::_reimport_group(const String &p_group_file, const Vector
 Error EditorFileSystem::_reimport_file(const String &p_file, const HashMap<StringName, Variant> &p_custom_options, const String &p_custom_importer, Variant *p_generator_parameters, bool p_update_file_system, bool p_defer_shared_state) {
 	print_verbose(vformat("EditorFileSystem: Importing file: %s", p_file));
 	uint64_t start_time = OS::get_singleton()->get_ticks_msec();
+	ImportScratchScope scratch_scope;
+	ImportScratchArena *scratch = scratch_scope.get();
 
 	EditorFileSystemDirectory *fs = nullptr;
 	int cpos = -1;
@@ -2836,7 +2900,8 @@ Error EditorFileSystem::_reimport_file(const String &p_file, const HashMap<Strin
 
 	//try to obtain existing params
 
-	HashMap<StringName, Variant> params(p_custom_options);
+	HashMap<StringName, Variant> &params = scratch->params;
+	params = p_custom_options;
 	String importer_name; //empty by default though
 
 	if (!p_custom_importer.is_empty()) {
@@ -2925,7 +2990,8 @@ Error EditorFileSystem::_reimport_file(const String &p_file, const HashMap<Strin
 
 	//mix with default params, in case a parameter is missing
 
-	List<ResourceImporter::ImportOption> opts;
+	List<ResourceImporter::ImportOption> &opts = scratch->opts;
+	opts.clear();
 	importer->get_import_options(p_file, &opts);
 	for (const ResourceImporter::ImportOption &E : opts) {
 		if (!params.has(E.option.name)) { //this one is not present
@@ -2949,14 +3015,17 @@ Error EditorFileSystem::_reimport_file(const String &p_file, const HashMap<Strin
 	//finally, perform import!!
 	String base_path = ResourceFormatImporter::get_singleton()->get_import_base_path(p_file);
 
-	List<String> import_variants;
-	List<String> gen_files;
+	List<String> &import_variants = scratch->import_variants;
+	import_variants.clear();
+	List<String> &gen_files = scratch->gen_files;
+	gen_files.clear();
 	Variant meta;
 	Error err = importer->import(uid, p_file, base_path, params, &import_variants, &gen_files, &meta);
 
 	// As import is complete, save the .import file.
 
-	Vector<String> dest_paths;
+	Vector<String> &dest_paths = scratch->dest_paths;
+	dest_paths.clear();
 	{
 		Ref<FileAccess> f = FileAccess::open(p_file + ".import", FileAccess::WRITE);
 		ERR_FAIL_COND_V_MSG(f.is_null(), ERR_FILE_CANT_OPEN, "Cannot open file from path '" + p_file + ".import'.");
@@ -3016,7 +3085,8 @@ Error EditorFileSystem::_reimport_file(const String &p_file, const HashMap<Strin
 		f->store_line("[deps]\n");
 
 		if (gen_files.size()) {
-			Array genf;
+			Array &genf = scratch->gen_files_array;
+			genf.clear();
 			for (const String &E : gen_files) {
 				genf.push_back(E);
 				dest_paths.push_back(E);
@@ -3031,7 +3101,8 @@ Error EditorFileSystem::_reimport_file(const String &p_file, const HashMap<Strin
 		f->store_line("source_file=" + Variant(p_file).get_construct_string());
 
 		if (dest_paths.size()) {
-			Array dp;
+			Array &dp = scratch->dest_files_array;
+			dp.clear();
 			for (int i = 0; i < dest_paths.size(); i++) {
 				dp.push_back(dest_paths[i]);
 			}
@@ -3346,21 +3417,33 @@ void EditorFileSystem::_flush_import_timing_csv() {
 void EditorFileSystem::_queue_import_work_result(const ImportWorkResult &p_result) {
 	MutexLock lock(import_work_results_mutex);
 	import_work_results.push_back(p_result);
+	import_work_results_pending.increment();
 }
 
 bool EditorFileSystem::_pop_import_work_result(ImportWorkResult &r_result) {
-	MutexLock lock(import_work_results_mutex);
-	if (import_work_results.is_empty()) {
+	if (import_work_results_pending.get() == 0) {
 		return false;
 	}
-	r_result = import_work_results[0];
-	import_work_results.remove_at(0);
+
+	MutexLock lock(import_work_results_mutex);
+	if (import_work_results_pending.get() == 0 || import_work_results_read_index >= uint32_t(import_work_results.size())) {
+		return false;
+	}
+	r_result = import_work_results[import_work_results_read_index++];
+	import_work_results_pending.decrement();
+
+	if (import_work_results_read_index >= uint32_t(import_work_results.size())) {
+		import_work_results.clear();
+		import_work_results_read_index = 0;
+	}
 	return true;
 }
 
 void EditorFileSystem::_clear_import_work_results() {
 	MutexLock lock(import_work_results_mutex);
 	import_work_results.clear();
+	import_work_results_read_index = 0;
+	import_work_results_pending.set(0);
 }
 
 void EditorFileSystem::_commit_import_work_result(const ImportWorkResult &p_result) {
@@ -3434,26 +3517,6 @@ void EditorFileSystem::_commit_import_work_result(const ImportWorkResult &p_resu
 	_record_import_timing(file, p_result.importer, "commit_done", commit_duration_ms, p_result.threaded, commit_error, p_result.threads_used, p_result.thread_pool_size, p_result.batch_size);
 }
 
-void EditorFileSystem::_scene_reimport_thread(void *p_userdata) {
-	SceneImportThreadData *thread_data = (SceneImportThreadData *)p_userdata;
-	ERR_FAIL_NULL(thread_data);
-	ERR_FAIL_NULL(thread_data->filesystem);
-	ERR_FAIL_NULL(thread_data->import_data);
-
-	while (true) {
-		int local_index = -1;
-		{
-			MutexLock lock(thread_data->next_index_mutex);
-			if (thread_data->next_index >= thread_data->import_data->batch_size) {
-				break;
-			}
-			local_index = thread_data->next_index++;
-		}
-
-		thread_data->filesystem->_reimport_thread(uint32_t(local_index), thread_data->import_data);
-	}
-}
-
 void EditorFileSystem::_reimport_thread(uint32_t p_index, ImportThreadData *p_import_data) {
 	ResourceLoader::set_is_import_thread(true);
 	int file_idx = p_import_data->reimport_from + int(p_index);
@@ -3466,15 +3529,27 @@ void EditorFileSystem::_reimport_thread(uint32_t p_index, ImportThreadData *p_im
 	_record_import_timing(import_file.path, import_file.importer, "worker_done", duration_ms, true, import_error, p_import_data->threads_used, p_import_data->thread_pool_size, p_import_data->batch_size);
 	_record_import_timing(import_file.path, import_file.importer, "asset", duration_ms, true, import_error, p_import_data->threads_used, p_import_data->thread_pool_size, p_import_data->batch_size);
 
-	ImportWorkResult work_result;
+	static thread_local ImportWorkResult work_result_arena;
+	ImportWorkResult &work_result = work_result_arena;
 	work_result.path = import_file.path;
 	work_result.importer = import_file.importer;
+	work_result.group_file.clear();
+	work_result.uid = ResourceUID::INVALID_ID;
 	work_result.error = import_error;
 	work_result.duration_ms = duration_ms;
+	work_result.source_modified_time = 0;
+	work_result.import_modified_time = 0;
+	work_result.import_md5.clear();
+	work_result.type.clear();
+	work_result.resource_script_class.clear();
+	work_result.import_valid = false;
 	work_result.threaded = true;
 	work_result.threads_used = p_import_data->threads_used;
 	work_result.thread_pool_size = p_import_data->thread_pool_size;
 	work_result.batch_size = p_import_data->batch_size;
+	work_result.dest_paths.clear();
+	work_result.gen_files.clear();
+	work_result.deps.clear();
 	_queue_import_work_result(work_result);
 
 	ResourceLoader::set_is_import_thread(false);
@@ -3635,33 +3710,15 @@ void EditorFileSystem::reimport_files(const Vector<String> &p_files) {
 						importer_worker_limit = MIN(importer_worker_limit, scene_parallel_reimport_max_workers);
 					}
 					tdata.threads_used = MIN(item_count, importer_worker_limit);
-					const bool use_dedicated_scene_threads = is_scene_batch && tdata.threads_used > 1;
 					print_line(vformat("Reimport batch \"%s\": assets=%d, workers=%d/%d, mode=%s",
 							reimport_files[from].importer,
 							item_count,
 							tdata.threads_used,
 							tdata.thread_pool_size,
-							use_dedicated_scene_threads ? "dedicated_threads" : "worker_pool"));
+							"worker_pool"));
 					_clear_import_work_results();
 
-					WorkerThreadPool::GroupID group_task = WorkerThreadPool::INVALID_TASK_ID;
-					LocalVector<Thread *> scene_threads;
-					SceneImportThreadData scene_thread_data;
-					if (use_dedicated_scene_threads) {
-						scene_thread_data.filesystem = this;
-						scene_thread_data.import_data = &tdata;
-						scene_threads.resize(tdata.threads_used);
-
-						Thread::Settings thread_settings;
-						thread_settings.priority = Thread::PRIORITY_NORMAL;
-						for (int thread_index = 0; thread_index < tdata.threads_used; thread_index++) {
-							Thread *scene_thread = memnew(Thread);
-							scene_threads[thread_index] = scene_thread;
-							scene_thread->start(_scene_reimport_thread, &scene_thread_data, thread_settings);
-						}
-					} else {
-						group_task = WorkerThreadPool::get_singleton()->add_template_group_task(this, &EditorFileSystem::_reimport_thread, &tdata, item_count, tdata.threads_used, false, vformat(TTR("Import resources of type: %s"), reimport_files[from].importer));
-					}
+					WorkerThreadPool::GroupID group_task = WorkerThreadPool::get_singleton()->add_template_group_task(this, &EditorFileSystem::_reimport_thread, &tdata, item_count, tdata.threads_used, false, vformat(TTR("Import resources of type: %s"), reimport_files[from].importer));
 
 					int imported_count = 0;
 					uint64_t last_wait_log_msec = OS::get_singleton()->get_ticks_msec();
@@ -3694,16 +3751,7 @@ void EditorFileSystem::reimport_files(const Vector<String> &p_files) {
 						OS::get_singleton()->delay_usec(1000);
 					}
 
-					if (use_dedicated_scene_threads) {
-						for (Thread *scene_thread : scene_threads) {
-							if (scene_thread->is_started()) {
-								scene_thread->wait_to_finish();
-							}
-							memdelete(scene_thread);
-						}
-					} else {
-						WorkerThreadPool::get_singleton()->wait_for_group_task_completion(group_task);
-					}
+					WorkerThreadPool::get_singleton()->wait_for_group_task_completion(group_task);
 					DEV_ASSERT(!imported_sem.try_wait());
 					ImportWorkResult remaining_result;
 					while (_pop_import_work_result(remaining_result)) {

@@ -360,13 +360,6 @@ class EditorFileSystem : public Node {
 		int batch_size = 1;
 	};
 
-	struct SceneImportThreadData {
-		EditorFileSystem *filesystem = nullptr;
-		ImportThreadData *import_data = nullptr;
-		Mutex next_index_mutex;
-		int next_index = 0;
-	};
-
 	struct ImportWorkResult {
 		String path;
 		String importer;
@@ -410,12 +403,13 @@ class EditorFileSystem : public Node {
 
 	Mutex import_work_results_mutex;
 	Vector<ImportWorkResult> import_work_results;
+	SafeNumeric<uint32_t> import_work_results_pending{ 0 };
+	uint32_t import_work_results_read_index = 0;
 	void _queue_import_work_result(const ImportWorkResult &p_result);
 	bool _pop_import_work_result(ImportWorkResult &r_result);
 	void _clear_import_work_results();
 	void _commit_import_work_result(const ImportWorkResult &p_result);
 
-	static void _scene_reimport_thread(void *p_userdata);
 	void _reimport_thread(uint32_t p_index, ImportThreadData *p_import_data);
 
 	static ResourceUID::ID _resource_saver_get_resource_id_for_path(const String &p_path, bool p_generate);
