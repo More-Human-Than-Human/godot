@@ -1210,6 +1210,7 @@ void EditorFileSystem::scan() {
 		filesystem = new_filesystem;
 		new_filesystem = nullptr;
 		_update_scan_actions();
+		_cleanup_orphan_imported_files();
 		// Update all icons so they are loaded for the FileSystemDock.
 		_update_files_icon_path();
 		scanning = false;
@@ -1727,6 +1728,63 @@ void EditorFileSystem::_delete_internal_files(const String &p_file) {
 	}
 }
 
+void EditorFileSystem::_collect_imported_files(EditorFileSystemDirectory *p_dir, HashSet<String> &r_imported_files) const {
+	ERR_FAIL_NULL(p_dir);
+
+	for (int i = 0; i < p_dir->files.size(); i++) {
+		const EditorFileSystemDirectory::FileInfo *file_info = p_dir->files[i];
+		for (const String &dest_path : file_info->import_dest_paths) {
+			r_imported_files.insert(dest_path);
+		}
+
+		// Keep sidecar checksums for actively imported files.
+		if (file_info->import_valid || !file_info->import_dest_paths.is_empty()) {
+			const String source_path = p_dir->get_file_path(i);
+			r_imported_files.insert(ResourceFormatImporter::get_singleton()->get_import_base_path(source_path) + ".md5");
+		}
+	}
+
+	for (int i = 0; i < p_dir->subdirs.size(); i++) {
+		_collect_imported_files(p_dir->subdirs[i], r_imported_files);
+	}
+}
+
+void EditorFileSystem::_cleanup_orphan_imported_files() {
+	if (!filesystem) {
+		return;
+	}
+
+	const String imported_files_path = ProjectSettings::get_singleton()->get_imported_files_path();
+	Ref<DirAccess> dir = DirAccess::open(imported_files_path);
+	if (dir.is_null()) {
+		return;
+	}
+
+	HashSet<String> imported_files;
+	_collect_imported_files(filesystem, imported_files);
+
+	if (dir->list_dir_begin() != OK) {
+		return;
+	}
+
+	while (true) {
+		String file_name = dir->get_next();
+		if (file_name.is_empty()) {
+			break;
+		}
+		if (dir->current_is_dir()) {
+			continue;
+		}
+
+		const String file_path = imported_files_path.path_join(file_name);
+		if (!imported_files.has(file_path)) {
+			dir->remove(file_path);
+		}
+	}
+
+	dir->list_dir_end();
+}
+
 int EditorFileSystem::_insert_actions_delete_files_directory(EditorFileSystemDirectory *p_dir) {
 	int nb_files = 0;
 	for (EditorFileSystemDirectory::FileInfo *fi : p_dir->files) {
@@ -1809,7 +1867,9 @@ void EditorFileSystem::scan_changes() {
 			sp.hi = nb_files_total;
 			scan_total = 0;
 			_scan_fs_changes(filesystem, sp);
-			if (_update_scan_actions()) {
+			const bool changed = _update_scan_actions();
+			_cleanup_orphan_imported_files();
+			if (changed) {
 				emit_signal(SNAME("filesystem_changed"));
 			}
 		}
@@ -1869,7 +1929,8 @@ void EditorFileSystem::_notification(int p_what) {
 						if (thread_sources.is_started()) {
 							thread_sources.wait_to_finish();
 						}
-						bool changed = _update_scan_actions();
+						const bool changed = _update_scan_actions();
+						_cleanup_orphan_imported_files();
 						// Set first_scan to false before the signals so the function doing_first_scan can return false
 						// in editor_node to start the export if needed.
 						first_scan = false;
@@ -1889,6 +1950,7 @@ void EditorFileSystem::_notification(int p_what) {
 					new_filesystem = nullptr;
 					thread.wait_to_finish();
 					_update_scan_actions();
+					_cleanup_orphan_imported_files();
 					// Update all icons so they are loaded for the FileSystemDock.
 					_update_files_icon_path();
 					// Set first_scan to false before the signals so the function doing_first_scan can return false

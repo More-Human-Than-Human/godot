@@ -250,6 +250,8 @@ class EditorFileSystem : public Node {
 	void _scan_fs_changes(EditorFileSystemDirectory *p_dir, ScanProgress &p_progress, bool p_recursive = true);
 
 	void _delete_internal_files(const String &p_file);
+	void _collect_imported_files(EditorFileSystemDirectory *p_dir, HashSet<String> &r_imported_files) const;
+	void _cleanup_orphan_imported_files();
 	int _insert_actions_delete_files_directory(EditorFileSystemDirectory *p_dir);
 
 	HashSet<String> textfile_extensions;
