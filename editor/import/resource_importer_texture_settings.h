@@ -30,9 +30,15 @@
 
 #pragma once
 
+#include "core/string/ustring.h"
+
 // ResourceImporterTextureSettings contains code used by
 // multiple texture importers and the export dialog.
 namespace ResourceImporterTextureSettings {
+bool use_footprint_policy();
+bool is_data_map_path(const String &p_source_file);
+bool should_disable_mipmaps_for_data_maps();
+int get_footprint_size_limit(bool p_is_3d_texture, bool p_is_data_map);
 bool should_import_s3tc_bptc();
 bool should_import_etc2_astc();
 } //namespace ResourceImporterTextureSettings

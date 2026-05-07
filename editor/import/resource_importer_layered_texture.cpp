@@ -306,6 +306,13 @@ Error ResourceImporterLayeredTexture::import(ResourceUID::ID p_source_id, const 
 	int high_quality_mode = p_options["compress/high_quality_mode"];
 	int hdr_compression = p_options["compress/hdr_compression"];
 	bool mipmaps = p_options["mipmaps/generate"];
+	const bool is_data_map = ResourceImporterTextureSettings::is_data_map_path(p_source_file);
+
+	if (ResourceImporterTextureSettings::use_footprint_policy() &&
+			is_data_map &&
+			ResourceImporterTextureSettings::should_disable_mipmaps_for_data_maps()) {
+		mipmaps = false;
+	}
 
 	int channel_pack = p_options["compress/channel_pack"];
 	int hslices = (p_options.has("slices/horizontal")) ? int(p_options["slices/horizontal"]) : 0;
@@ -348,6 +355,21 @@ Error ResourceImporterLayeredTexture::import(ResourceUID::ID p_source_id, const 
 	Error err = ImageLoader::load_image(p_source_file, image);
 	if (err != OK) {
 		return err;
+	}
+
+	if (ResourceImporterTextureSettings::use_footprint_policy()) {
+		const int size_limit = ResourceImporterTextureSettings::get_footprint_size_limit(true, is_data_map);
+		if (size_limit > 0 && (image->get_width() > size_limit || image->get_height() > size_limit)) {
+			if (image->get_width() >= image->get_height()) {
+				const int new_width = size_limit;
+				const int new_height = image->get_height() * new_width / image->get_width();
+				image->resize(new_width, new_height, Image::INTERPOLATE_CUBIC);
+			} else {
+				const int new_height = size_limit;
+				const int new_width = image->get_width() * new_height / image->get_height();
+				image->resize(new_width, new_height, Image::INTERPOLATE_CUBIC);
+			}
+		}
 	}
 
 	if (compress_mode == COMPRESS_VRAM_COMPRESSED) {

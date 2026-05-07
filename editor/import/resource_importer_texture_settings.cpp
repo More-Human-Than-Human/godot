@@ -33,8 +33,55 @@
 #include "core/config/project_settings.h"
 #include "core/os/os.h"
 
+namespace {
+
+static bool _source_matches_patterns(const String &p_source_file, const String &p_patterns_csv) {
+	const String source_lower = p_source_file.to_lower();
+	const PackedStringArray patterns = p_patterns_csv.split(",", false);
+	for (const String &pattern_raw : patterns) {
+		const String pattern = pattern_raw.strip_edges().to_lower();
+		if (!pattern.is_empty() && source_lower.findn(pattern) != -1) {
+			return true;
+		}
+	}
+	return false;
+}
+
+} // namespace
+
 // ResourceImporterTextureSettings contains code used by
 // multiple texture importers and the export dialog.
+bool ResourceImporterTextureSettings::use_footprint_policy() {
+	return bool(GLOBAL_GET("editor/import/texture/footprint_policy_enabled"));
+}
+
+bool ResourceImporterTextureSettings::is_data_map_path(const String &p_source_file) {
+	return _source_matches_patterns(p_source_file, GLOBAL_GET("editor/import/texture/data_map_name_patterns"));
+}
+
+bool ResourceImporterTextureSettings::should_disable_mipmaps_for_data_maps() {
+	return bool(GLOBAL_GET("editor/import/texture/disable_mipmaps_for_data_maps"));
+}
+
+int ResourceImporterTextureSettings::get_footprint_size_limit(bool p_is_3d_texture, bool p_is_data_map) {
+	if (!use_footprint_policy()) {
+		return 0;
+	}
+
+	int size_limit = p_is_3d_texture ? int(GLOBAL_GET("editor/import/texture/max_size_3d")) : int(GLOBAL_GET("editor/import/texture/max_size_2d"));
+	if (p_is_data_map) {
+		const int data_map_limit = int(GLOBAL_GET("editor/import/texture/max_size_data_maps"));
+		if (data_map_limit > 0 && (size_limit <= 0 || data_map_limit < size_limit)) {
+			size_limit = data_map_limit;
+		}
+	}
+
+	if (size_limit < 0) {
+		size_limit = 0;
+	}
+	return size_limit;
+}
+
 bool ResourceImporterTextureSettings::should_import_s3tc_bptc() {
 	if (GLOBAL_GET("rendering/textures/vram_compression/import_s3tc_bptc")) {
 		return true;

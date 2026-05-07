@@ -711,10 +711,11 @@ Error ResourceImporterTexture::import(ResourceUID::ID p_source_id, const String 
 	const int hdr_compression = p_options["compress/hdr_compression"];
 	const int high_quality = p_options["compress/high_quality"];
 	const int high_quality_mode = p_options["compress/high_quality_mode"];
+	const bool detect_3d = int(p_options["detect_3d/compress_to"]) > 0;
 
 	// Mipmaps.
-	const bool mipmaps = p_options["mipmaps/generate"];
-	const uint32_t mipmap_limit = mipmaps ? uint32_t(p_options["mipmaps/limit"]) : uint32_t(-1);
+	bool mipmaps = p_options["mipmaps/generate"];
+	uint32_t mipmap_limit = mipmaps ? uint32_t(p_options["mipmaps/limit"]) : uint32_t(-1);
 
 	// Roughness.
 	const int roughness = p_options["roughness/mode"];
@@ -732,6 +733,19 @@ Error ResourceImporterTexture::import(ResourceUID::ID p_source_id, const String 
 	const bool hdr_as_srgb = p_options["process/hdr_as_srgb"];
 	const bool hdr_clamp_exposure = p_options["process/hdr_clamp_exposure"];
 	int size_limit = p_options["process/size_limit"];
+
+	if (ResourceImporterTextureSettings::use_footprint_policy()) {
+		const bool is_data_map = ResourceImporterTextureSettings::is_data_map_path(p_source_file);
+		if (is_data_map && ResourceImporterTextureSettings::should_disable_mipmaps_for_data_maps()) {
+			mipmaps = false;
+			mipmap_limit = uint32_t(-1);
+		}
+
+		const int footprint_size_limit = ResourceImporterTextureSettings::get_footprint_size_limit(detect_3d, is_data_map);
+		if (footprint_size_limit > 0 && (size_limit == 0 || footprint_size_limit < size_limit)) {
+			size_limit = footprint_size_limit;
+		}
+	}
 
 	const Image::BasisUniversalPackerParams basisu_params = {
 		p_options["compress/uastc_level"],
@@ -881,7 +895,6 @@ Error ResourceImporterTexture::import(ResourceUID::ID p_source_id, const String 
 		}
 	}
 
-	bool detect_3d = int(p_options["detect_3d/compress_to"]) > 0;
 	bool detect_roughness = roughness == 0;
 	bool detect_normal = normal == 0;
 	bool force_normal = normal == 1;
