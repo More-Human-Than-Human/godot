@@ -362,6 +362,18 @@ class EditorFileSystem : public Node {
 		int batch_size = 1;
 	};
 
+	struct SceneGroupUpdateResult {
+		String path;
+		HashSet<StringName> scene_groups;
+		bool file_exists = false;
+	};
+
+	struct SceneGroupThreadData {
+		const String *scene_paths = nullptr;
+		SceneGroupUpdateResult *scene_group_results = nullptr;
+		Semaphore *scene_group_sem = nullptr;
+	};
+
 	struct ImportWorkResult {
 		String path;
 		String importer;
@@ -412,6 +424,7 @@ class EditorFileSystem : public Node {
 	void _clear_import_work_results();
 	void _commit_import_work_result(const ImportWorkResult &p_result);
 
+	void _update_scene_group_thread(uint32_t p_index, SceneGroupThreadData *p_update_data);
 	void _reimport_thread(uint32_t p_index, ImportThreadData *p_import_data);
 
 	static ResourceUID::ID _resource_saver_get_resource_id_for_path(const String &p_path, bool p_generate);

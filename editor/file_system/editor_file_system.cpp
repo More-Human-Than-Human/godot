@@ -2466,44 +2466,137 @@ void EditorFileSystem::_queue_update_script_class(const String &p_path, const Sc
 	update_script_paths_documentation.insert(p_path);
 }
 
+void EditorFileSystem::_update_scene_group_thread(uint32_t p_index, SceneGroupThreadData *p_update_data) {
+	ERR_FAIL_NULL(p_update_data);
+	ERR_FAIL_NULL(p_update_data->scene_paths);
+	ERR_FAIL_NULL(p_update_data->scene_group_results);
+	ERR_FAIL_NULL(p_update_data->scene_group_sem);
+
+	SceneGroupUpdateResult &result = p_update_data->scene_group_results[p_index];
+	result.path = p_update_data->scene_paths[p_index];
+	result.file_exists = FileAccess::exists(result.path);
+	result.scene_groups.clear();
+	if (result.file_exists) {
+		result.scene_groups = PackedScene::get_scene_groups(result.path);
+	}
+
+	p_update_data->scene_group_sem->post();
+}
+
 void EditorFileSystem::_update_scene_groups() {
-	if (update_scene_paths.is_empty()) {
-		return;
-	}
-
-	EditorProgress *ep = nullptr;
-	if (update_scene_paths.size() > 20) {
-		ep = memnew(EditorProgress("update_scene_groups", TTR("Updating Scene Groups"), update_scene_paths.size()));
-	}
-	int step_count = 0;
-
+	Vector<String> scene_paths;
 	{
 		MutexLock update_scene_lock(update_scene_mutex);
-		for (const String &path : update_scene_paths) {
-			ProjectSettings::get_singleton()->remove_scene_groups_cache(path);
-
-			int index = -1;
-			EditorFileSystemDirectory *efd = find_file(path, &index);
-
-			if (!efd || index < 0) {
-				// The file was removed.
-				continue;
-			}
-
-			const HashSet<StringName> scene_groups = PackedScene::get_scene_groups(path);
-			if (!scene_groups.is_empty()) {
-				ProjectSettings::get_singleton()->add_scene_groups_cache(path, scene_groups);
-			}
-
-			if (ep) {
-				ep->step(efd->files[index]->file, step_count++, false);
-			}
+		if (update_scene_paths.is_empty()) {
+			return;
 		}
 
-		memdelete(ep);
+		scene_paths.resize(update_scene_paths.size());
+		int scene_path_index = 0;
+		for (const String &path : update_scene_paths) {
+			scene_paths.write[scene_path_index++] = path;
+		}
 		update_scene_paths.clear();
 	}
 
+	EditorProgress *ep = nullptr;
+	if (scene_paths.size() > 20) {
+		ep = memnew(EditorProgress("update_scene_groups", TTR("Updating Scene Groups"), scene_paths.size()));
+	}
+
+	Vector<SceneGroupUpdateResult> scene_group_results;
+	scene_group_results.resize(scene_paths.size());
+
+	bool use_multiple_threads = false;
+	int scene_group_workers = 1;
+	constexpr int MIN_SCENE_GROUP_PARALLEL_FILES = 16;
+
+#ifdef WEB_ENABLED
+	// On web, this loop runs on the main thread. Busy waits freeze the tab event loop.
+	use_multiple_threads = false;
+#elif defined(THREADS_ENABLED)
+	const bool enable_scene_group_parallel_update = bool(
+			GLOBAL_DEF("editor/import/experimental/enable_scene_group_parallel_update", true));
+	int scene_group_parallel_update_max_workers = int(
+			GLOBAL_DEF("editor/import/experimental/scene_group_parallel_update_max_workers", 4));
+	scene_group_parallel_update_max_workers = MAX(1, scene_group_parallel_update_max_workers);
+	const int worker_thread_pool_size = MAX(1, WorkerThreadPool::get_singleton()->get_thread_count());
+	const int worker_limit = MAX(1, worker_thread_pool_size - 1);
+	scene_group_workers = MIN(scene_group_parallel_update_max_workers, worker_limit);
+	use_multiple_threads = enable_scene_group_parallel_update &&
+			scene_paths.size() >= MIN_SCENE_GROUP_PARALLEL_FILES &&
+			scene_group_workers > 1;
+#endif
+
+	if (use_multiple_threads) {
+		Semaphore scene_group_sem;
+		SceneGroupThreadData scene_group_thread_data;
+		scene_group_thread_data.scene_paths = scene_paths.ptr();
+		scene_group_thread_data.scene_group_results = scene_group_results.ptrw();
+		scene_group_thread_data.scene_group_sem = &scene_group_sem;
+
+		WorkerThreadPool::GroupID group_task = WorkerThreadPool::get_singleton()->add_template_group_task(
+				this,
+				&EditorFileSystem::_update_scene_group_thread,
+				&scene_group_thread_data,
+				scene_paths.size(),
+				scene_group_workers,
+				false,
+				TTR("Collect scene groups"));
+		if (group_task != WorkerThreadPool::INVALID_TASK_ID) {
+			int completed_count = 0;
+			const int total_count = scene_paths.size();
+			while (completed_count < total_count) {
+				if (!scene_group_sem.try_wait()) {
+					OS::get_singleton()->delay_usec(1000);
+					continue;
+				}
+
+				completed_count++;
+				if (ep) {
+					ep->step(vformat(TTR("Collecting scene groups... (%d/%d)"), completed_count, total_count), completed_count - 1, false);
+				}
+			}
+
+			WorkerThreadPool::get_singleton()->wait_for_group_task_completion(group_task);
+		} else {
+			for (int i = 0; i < scene_paths.size(); i++) {
+				SceneGroupUpdateResult &result = scene_group_results.write[i];
+				result.path = scene_paths[i];
+				result.file_exists = FileAccess::exists(result.path);
+				result.scene_groups.clear();
+				if (result.file_exists) {
+					result.scene_groups = PackedScene::get_scene_groups(result.path);
+				}
+				if (ep) {
+					ep->step(result.path.get_file(), i, false);
+				}
+			}
+		}
+	} else {
+		for (int i = 0; i < scene_paths.size(); i++) {
+			SceneGroupUpdateResult &result = scene_group_results.write[i];
+			result.path = scene_paths[i];
+			result.file_exists = FileAccess::exists(result.path);
+			result.scene_groups.clear();
+			if (result.file_exists) {
+				result.scene_groups = PackedScene::get_scene_groups(result.path);
+			}
+			if (ep) {
+				ep->step(result.path.get_file(), i, false);
+			}
+		}
+	}
+
+	for (int i = 0; i < scene_group_results.size(); i++) {
+		const SceneGroupUpdateResult &result = scene_group_results[i];
+		ProjectSettings::get_singleton()->remove_scene_groups_cache(result.path);
+		if (result.file_exists && !result.scene_groups.is_empty()) {
+			ProjectSettings::get_singleton()->add_scene_groups_cache(result.path, result.scene_groups);
+		}
+	}
+
+	memdelete(ep);
 	ProjectSettings::get_singleton()->save_scene_groups_cache();
 }
 
