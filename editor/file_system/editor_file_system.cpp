@@ -178,6 +178,11 @@ static void _collect_imported_cache_entries(const String &p_dir_path, const Hash
 	dir->list_dir_end();
 }
 
+static bool _is_scene_group_cache_candidate(const String &p_path) {
+	const String extension = p_path.get_extension().to_lower();
+	return extension == "tscn" || extension == "scn" || extension == "res" || extension == "tres";
+}
+
 } // namespace
 
 int EditorFileSystemDirectory::find_file_index(const String &p_file) const {
@@ -2574,6 +2579,7 @@ void EditorFileSystem::_update_scene_group_thread(uint32_t p_index, SceneGroupTh
 
 	SceneGroupUpdateResult &result = p_update_data->scene_group_results[p_index];
 	result.path = p_update_data->scene_paths[p_index];
+	const bool is_group_candidate = _is_scene_group_cache_candidate(result.path);
 	const uint64_t start_time = OS::get_singleton()->get_ticks_msec();
 	if (p_update_data->debug_log_enabled) {
 		print_line(vformat("Scene groups worker start: %d %s", int(p_index), result.path));
@@ -2581,7 +2587,7 @@ void EditorFileSystem::_update_scene_group_thread(uint32_t p_index, SceneGroupTh
 
 	result.file_exists = FileAccess::exists(result.path);
 	result.scene_groups.clear();
-	if (result.file_exists) {
+	if (result.file_exists && is_group_candidate) {
 		result.scene_groups = PackedScene::get_scene_groups(result.path);
 	}
 
@@ -2593,6 +2599,9 @@ void EditorFileSystem::_update_scene_group_thread(uint32_t p_index, SceneGroupTh
 				result.file_exists ? "true" : "false",
 				result.scene_groups.size(),
 				int(duration_ms)));
+		if (result.file_exists && !is_group_candidate) {
+			print_line(vformat("Scene groups worker skipped non-native scene path: %s", result.path));
+		}
 	}
 
 	ResourceLoader::set_is_import_thread(false);
@@ -2710,7 +2719,7 @@ void EditorFileSystem::_update_scene_groups() {
 				result.path = scene_paths[i];
 				result.file_exists = FileAccess::exists(result.path);
 				result.scene_groups.clear();
-				if (result.file_exists) {
+				if (result.file_exists && _is_scene_group_cache_candidate(result.path)) {
 					result.scene_groups = PackedScene::get_scene_groups(result.path);
 				}
 				if (ep) {
@@ -2724,7 +2733,7 @@ void EditorFileSystem::_update_scene_groups() {
 			result.path = scene_paths[i];
 			result.file_exists = FileAccess::exists(result.path);
 			result.scene_groups.clear();
-			if (result.file_exists) {
+			if (result.file_exists && _is_scene_group_cache_candidate(result.path)) {
 				result.scene_groups = PackedScene::get_scene_groups(result.path);
 			}
 			if (ep) {
@@ -2755,6 +2764,10 @@ void EditorFileSystem::_update_pending_scene_groups() {
 }
 
 void EditorFileSystem::_queue_update_scene_groups(const String &p_path) {
+	if (!_is_scene_group_cache_candidate(p_path)) {
+		return;
+	}
+
 	MutexLock update_scene_lock(update_scene_mutex);
 	update_scene_paths.insert(p_path);
 }
@@ -2762,7 +2775,10 @@ void EditorFileSystem::_queue_update_scene_groups(const String &p_path) {
 void EditorFileSystem::_get_all_scenes(EditorFileSystemDirectory *p_dir, HashSet<String> &r_list) {
 	for (int i = 0; i < p_dir->get_file_count(); i++) {
 		if (p_dir->get_file_type(i) == SNAME("PackedScene")) {
-			r_list.insert(p_dir->get_file_path(i));
+			const String scene_path = p_dir->get_file_path(i);
+			if (_is_scene_group_cache_candidate(scene_path)) {
+				r_list.insert(scene_path);
+			}
 		}
 	}
 
