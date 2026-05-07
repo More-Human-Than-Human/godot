@@ -285,6 +285,7 @@ class EditorFileSystem : public Node {
 	Vector<String> _get_import_dest_paths(const String &p_path);
 
 	bool reimport_on_missing_imported_files;
+	bool lazy_reimport_on_scan = false;
 
 	Vector<String> _get_dependencies(const String &p_path);
 

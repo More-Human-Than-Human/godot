@@ -30,6 +30,7 @@
 
 #include "resource_importer.h"
 
+#include "core/config/engine.h"
 #include "core/config/project_settings.h"
 #include "core/io/config_file.h"
 #include "core/io/image.h"
@@ -40,6 +41,8 @@
 bool ResourceFormatImporter::SortImporterByName::operator()(const Ref<ResourceImporter> &p_a, const Ref<ResourceImporter> &p_b) const {
 	return p_a->get_importer_name() < p_b->get_importer_name();
 }
+
+static thread_local bool resource_import_lazy_retry_in_progress = false;
 
 Error ResourceFormatImporter::_get_path_and_type(const String &p_path, PathAndType &r_path_and_type, bool p_load, bool *r_valid) const {
 	Error err;
@@ -166,7 +169,25 @@ Ref<Resource> ResourceFormatImporter::load(const String &p_path, const String &p
 	}
 #endif
 
-	return load_internal(p_path, r_error, p_use_sub_threads, r_progress, p_cache_mode, false);
+	Ref<Resource> res = load_internal(p_path, r_error, p_use_sub_threads, r_progress, p_cache_mode, false);
+
+#ifdef TOOLS_ENABLED
+	if (res.is_null() &&
+			Engine::get_singleton()->is_editor_hint() &&
+			!resource_import_lazy_retry_in_progress &&
+			bool(GLOBAL_DEF("editor/import/lazy_reimport_on_load", true)) &&
+			ResourceLoader::import != nullptr) {
+		resource_import_lazy_retry_in_progress = true;
+		const Error import_error = ResourceLoader::import(p_path);
+		resource_import_lazy_retry_in_progress = false;
+
+		if (import_error == OK) {
+			res = load_internal(p_path, r_error, p_use_sub_threads, r_progress, p_cache_mode, false);
+		}
+	}
+#endif
+
+	return res;
 }
 
 Ref<Resource> ResourceFormatImporter::load_internal(const String &p_path, Error *r_error, bool p_use_sub_threads, float *r_progress, CacheMode p_cache_mode, bool p_silence_errors) {

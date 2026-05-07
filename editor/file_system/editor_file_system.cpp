@@ -1429,11 +1429,13 @@ void EditorFileSystem::_process_file_system(const ScannedDirectory *p_scan_dir, 
 				// the md5 of all files and import settings and, if necessary, execute a reimportation.
 				if (_is_test_for_reimport_needed(path, fc->modification_time, mt, fc->import_modification_time, import_mt, fi->import_dest_paths) ||
 						(revalidate_import_files && !ResourceFormatImporter::get_singleton()->are_import_settings_valid(path))) {
-					ItemAction ia;
-					ia.action = ItemAction::ACTION_FILE_TEST_REIMPORT;
-					ia.dir = p_dir;
-					ia.file = fi->file;
-					scan_actions.push_back(ia);
+					if (!lazy_reimport_on_scan) {
+						ItemAction ia;
+						ia.action = ItemAction::ACTION_FILE_TEST_REIMPORT;
+						ia.dir = p_dir;
+						ia.file = fi->file;
+						scan_actions.push_back(ia);
+					}
 				}
 
 				if (fc->type.is_empty()) {
@@ -1459,11 +1461,20 @@ void EditorFileSystem::_process_file_system(const ScannedDirectory *p_scan_dir, 
 				fi->import_dest_paths = Vector<String>();
 				fi->import_valid = (fi->type == "TextFile" || fi->type == "OtherFile") ? true : ResourceLoader::is_import_valid(path);
 
-				ItemAction ia;
-				ia.action = ItemAction::ACTION_FILE_TEST_REIMPORT;
-				ia.dir = p_dir;
-				ia.file = fi->file;
-				scan_actions.push_back(ia);
+				if (lazy_reimport_on_scan) {
+					if (fi->type.is_empty()) {
+						Ref<ResourceImporter> importer = ResourceFormatImporter::get_singleton()->get_importer_by_file(path);
+						if (importer.is_valid()) {
+							fi->type = importer->get_resource_type();
+						}
+					}
+				} else {
+					ItemAction ia;
+					ia.action = ItemAction::ACTION_FILE_TEST_REIMPORT;
+					ia.dir = p_dir;
+					ia.file = fi->file;
+					scan_actions.push_back(ia);
+				}
 			}
 		} else {
 			if (fc && fc->modification_time == mt) {
@@ -1691,11 +1702,20 @@ void EditorFileSystem::_scan_fs_changes(EditorFileSystemDirectory *p_dir, ScanPr
 
 					if (_can_import_file(f)) {
 						//if it can be imported, and it was added, it needs to be reimported
-						ItemAction ia;
-						ia.action = ItemAction::ACTION_FILE_TEST_REIMPORT;
-						ia.dir = p_dir;
-						ia.file = f;
-						scan_actions.push_back(ia);
+						if (lazy_reimport_on_scan) {
+							if (fi->type.is_empty()) {
+								Ref<ResourceImporter> importer = ResourceFormatImporter::get_singleton()->get_importer_by_file(path);
+								if (importer.is_valid()) {
+									fi->type = importer->get_resource_type();
+								}
+							}
+						} else {
+							ItemAction ia;
+							ia.action = ItemAction::ACTION_FILE_TEST_REIMPORT;
+							ia.dir = p_dir;
+							ia.file = f;
+							scan_actions.push_back(ia);
+						}
 					}
 					diff_nb_files++;
 				} else {
@@ -1729,11 +1749,13 @@ void EditorFileSystem::_scan_fs_changes(EditorFileSystemDirectory *p_dir, ScanPr
 			uint64_t mt = FileAccess::get_modified_time(path);
 			uint64_t import_mt = FileAccess::get_modified_time(path + ".import");
 			if (_is_test_for_reimport_needed(path, p_dir->files[i]->modified_time, mt, p_dir->files[i]->import_modified_time, import_mt, p_dir->files[i]->import_dest_paths)) {
-				ItemAction ia;
-				ia.action = ItemAction::ACTION_FILE_TEST_REIMPORT;
-				ia.dir = p_dir;
-				ia.file = p_dir->files[i]->file;
-				scan_actions.push_back(ia);
+				if (!lazy_reimport_on_scan) {
+					ItemAction ia;
+					ia.action = ItemAction::ACTION_FILE_TEST_REIMPORT;
+					ia.dir = p_dir;
+					ia.file = p_dir->files[i]->file;
+					scan_actions.push_back(ia);
+				}
 			}
 		} else {
 			uint64_t mt = FileAccess::get_modified_time(path);
@@ -4535,6 +4557,7 @@ EditorFileSystem::EditorFileSystem() {
 
 	ResourceLoader::import = _resource_import;
 	reimport_on_missing_imported_files = GLOBAL_GET("editor/import/reimport_missing_imported_files");
+	lazy_reimport_on_scan = GLOBAL_GET("editor/import/lazy_reimport_on_scan");
 	singleton = this;
 	filesystem = memnew(EditorFileSystemDirectory); //like, empty
 	filesystem->parent = nullptr;
