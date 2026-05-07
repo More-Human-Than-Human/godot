@@ -159,6 +159,14 @@ static bool _find_existing_internal_variant_path(const String &p_internal_path, 
 	return false;
 }
 
+static bool _is_missing_project_imported_path(const String &p_path) {
+	if (!ProjectSettings::get_singleton()) {
+		return false;
+	}
+	const String imported_dir_path = ProjectSettings::get_singleton()->get_project_data_path().path_join("imported");
+	return p_path.begins_with(imported_dir_path + "/") && !FileAccess::exists(p_path);
+}
+
 static bool _import_file_references_internal_path(const String &p_import_file_path, const String &p_internal_path, String &r_source_file) {
 	const String import_source_candidate = p_import_file_path.trim_suffix(".import");
 
@@ -554,6 +562,32 @@ Ref<Resource> ResourceLoader::_load(const String &p_path, const String &p_origin
 
 	print_verbose(vformat("Loading resource: %s remapped: %s", p_path, _path_remap(p_path)));
 
+#ifdef TOOLS_ENABLED
+	if (Engine::get_singleton()->is_editor_hint() && _is_missing_project_imported_path(p_path)) {
+		String existing_variant_path;
+		if (_find_existing_internal_variant_path(p_path, existing_variant_path)) {
+			_log_lazy_internal_debug(vformat("[lazy-missing] trying existing fallback variant: missing=%s fallback=%s", p_path, existing_variant_path));
+			res_ref_overrides.erase(load_nesting);
+			load_nesting--;
+			return _load(existing_variant_path, p_original_path, p_type_hint, p_cache_mode, r_error, p_use_sub_threads, r_progress);
+		}
+
+		if (_try_lazy_reimport_missing_internal_resource(p_path)) {
+			_log_lazy_internal_debug(vformat("[lazy-missing] retrying original path after reimport: %s", p_path));
+			res_ref_overrides.erase(load_nesting);
+			load_nesting--;
+			return _load(p_path, p_original_path, p_type_hint, p_cache_mode, r_error, p_use_sub_threads, r_progress);
+		}
+
+		if (r_error) {
+			*r_error = ERR_FILE_NOT_FOUND;
+		}
+		res_ref_overrides.erase(load_nesting);
+		load_nesting--;
+		return Ref<Resource>();
+	}
+#endif
+
 	// Try all loaders and pick the first match for the type hint
 	bool found = false;
 	Ref<Resource> res;
@@ -578,17 +612,6 @@ Ref<Resource> ResourceLoader::_load(const String &p_path, const String &p_origin
 	}
 
 #ifdef TOOLS_ENABLED
-	String existing_variant_path;
-	if (_find_existing_internal_variant_path(p_path, existing_variant_path)) {
-		_log_lazy_internal_debug(vformat("[lazy-missing] trying existing fallback variant: missing=%s fallback=%s", p_path, existing_variant_path));
-		return _load(existing_variant_path, p_original_path, p_type_hint, p_cache_mode, r_error, p_use_sub_threads, r_progress);
-	}
-
-	if (_try_lazy_reimport_missing_internal_resource(p_path)) {
-		_log_lazy_internal_debug(vformat("[lazy-missing] retrying original path after reimport: %s", p_path));
-		return _load(p_path, p_original_path, p_type_hint, p_cache_mode, r_error, p_use_sub_threads, r_progress);
-	}
-
 	if (Engine::get_singleton()->is_editor_hint()) {
 		if (ResourceFormatImporter::get_singleton()->get_importer_by_file(p_path).is_valid()) {
 			// The format is known to the editor, but the file hasn't been imported
@@ -598,6 +621,17 @@ Ref<Resource> ResourceLoader::_load(const String &p_path, const String &p_origin
 				*r_error = ERR_FILE_NOT_FOUND;
 			}
 		}
+	}
+#endif
+
+#ifdef TOOLS_ENABLED
+	if (found &&
+			Engine::get_singleton()->is_editor_hint() &&
+			!Thread::is_main_thread() &&
+			r_error != nullptr &&
+			*r_error == ERR_FILE_NOT_FOUND &&
+			ResourceLoader::is_imported(p_path)) {
+		return Ref<Resource>();
 	}
 #endif
 
