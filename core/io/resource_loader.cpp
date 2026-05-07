@@ -64,6 +64,100 @@ namespace {
 
 static thread_local bool missing_internal_resource_retry_in_progress = false;
 
+static bool _is_lazy_internal_debug_log_enabled() {
+	if (!ProjectSettings::get_singleton()) {
+		return false;
+	}
+	return bool(GLOBAL_GET("editor/import/experimental/lazy_missing_internal_debug_log"));
+}
+
+static void _log_lazy_internal_debug(const String &p_message) {
+	if (_is_lazy_internal_debug_log_enabled()) {
+		print_line(p_message);
+	}
+}
+
+static bool _is_git_lfs_pointer_file(const String &p_path, String &r_oid, int64_t &r_declared_size) {
+	r_oid = String();
+	r_declared_size = -1;
+
+	Error err;
+	Ref<FileAccess> f = FileAccess::open(p_path, FileAccess::READ, &err);
+	if (f.is_null()) {
+		return false;
+	}
+
+	// Git LFS pointer files are tiny text manifests.
+	if (f->get_length() > 1024) {
+		return false;
+	}
+
+	const String line1 = f->get_line().strip_edges();
+	const String line2 = f->get_line().strip_edges();
+	const String line3 = f->get_line().strip_edges();
+
+	if (line1 != "version https://git-lfs.github.com/spec/v1") {
+		return false;
+	}
+	if (!line2.begins_with("oid sha256:")) {
+		return false;
+	}
+	if (!line3.begins_with("size ")) {
+		return false;
+	}
+
+	const String size_str = line3.trim_prefix("size ");
+	if (!size_str.is_valid_int()) {
+		return false;
+	}
+
+	r_oid = line2.trim_prefix("oid sha256:");
+	r_declared_size = size_str.to_int();
+	return true;
+}
+
+static bool _find_existing_internal_variant_path(const String &p_internal_path, String &r_variant_path) {
+	if (FileAccess::exists(p_internal_path)) {
+		return false;
+	}
+
+	const String imported_dir_path = ProjectSettings::get_singleton()->get_project_data_path().path_join("imported");
+	if (!p_internal_path.begins_with(imported_dir_path + "/")) {
+		return false;
+	}
+	if (!p_internal_path.ends_with(".ctex")) {
+		return false;
+	}
+
+	String base_path = p_internal_path;
+	Vector<String> candidate_suffixes;
+	if (p_internal_path.ends_with(".s3tc.ctex")) {
+		base_path = p_internal_path.trim_suffix(".s3tc.ctex");
+		candidate_suffixes = { ".bptc.ctex", ".etc2.ctex", ".astc.ctex", ".ctex" };
+	} else if (p_internal_path.ends_with(".bptc.ctex")) {
+		base_path = p_internal_path.trim_suffix(".bptc.ctex");
+		candidate_suffixes = { ".s3tc.ctex", ".etc2.ctex", ".astc.ctex", ".ctex" };
+	} else if (p_internal_path.ends_with(".etc2.ctex")) {
+		base_path = p_internal_path.trim_suffix(".etc2.ctex");
+		candidate_suffixes = { ".astc.ctex", ".s3tc.ctex", ".bptc.ctex", ".ctex" };
+	} else if (p_internal_path.ends_with(".astc.ctex")) {
+		base_path = p_internal_path.trim_suffix(".astc.ctex");
+		candidate_suffixes = { ".etc2.ctex", ".s3tc.ctex", ".bptc.ctex", ".ctex" };
+	} else {
+		return false;
+	}
+
+	for (const String &suffix : candidate_suffixes) {
+		const String candidate_path = base_path + suffix;
+		if (FileAccess::exists(candidate_path)) {
+			r_variant_path = candidate_path;
+			return true;
+		}
+	}
+
+	return false;
+}
+
 static bool _import_file_references_internal_path(const String &p_import_file_path, const String &p_internal_path, String &r_source_file) {
 	const String import_source_candidate = p_import_file_path.trim_suffix(".import");
 
@@ -114,8 +208,10 @@ static bool _import_file_references_internal_path(const String &p_import_file_pa
 
 	String resolved_source = r_source_file;
 	if (resolved_source.is_empty() || !FileAccess::exists(resolved_source)) {
+		_log_lazy_internal_debug(vformat("[lazy-missing] source_file invalid in %s (source=%s), trying sibling source", p_import_file_path, resolved_source));
 		if (FileAccess::exists(import_source_candidate)) {
 			resolved_source = import_source_candidate;
+			_log_lazy_internal_debug(vformat("[lazy-missing] using sibling source candidate: %s", resolved_source));
 		}
 	}
 
@@ -173,31 +269,60 @@ static bool _find_source_for_internal_resource_recursive(const String &p_dir_pat
 }
 
 static bool _try_lazy_reimport_missing_internal_resource(const String &p_internal_path) {
-	if (!Engine::get_singleton()->is_editor_hint() ||
-			!bool(GLOBAL_GET("editor/import/lazy_reimport_on_load")) ||
-			ResourceLoader::import == nullptr ||
-			missing_internal_resource_retry_in_progress ||
-			!Thread::is_main_thread()) {
+	if (!Engine::get_singleton()->is_editor_hint()) {
+		_log_lazy_internal_debug(vformat("[lazy-missing] skip (not editor hint): %s", p_internal_path));
+		return false;
+	}
+	if (!bool(GLOBAL_GET("editor/import/lazy_reimport_on_load"))) {
+		_log_lazy_internal_debug(vformat("[lazy-missing] skip (lazy_reimport_on_load disabled): %s", p_internal_path));
+		return false;
+	}
+	if (ResourceLoader::import == nullptr) {
+		_log_lazy_internal_debug(vformat("[lazy-missing] skip (ResourceLoader::import is null): %s", p_internal_path));
+		return false;
+	}
+	if (missing_internal_resource_retry_in_progress) {
+		_log_lazy_internal_debug(vformat("[lazy-missing] skip (retry already in progress): %s", p_internal_path));
+		return false;
+	}
+	if (!Thread::is_main_thread()) {
+		_log_lazy_internal_debug(vformat("[lazy-missing] skip (not main thread): %s", p_internal_path));
 		return false;
 	}
 
 	const String imported_dir_path = ProjectSettings::get_singleton()->get_project_data_path().path_join("imported");
 	if (!p_internal_path.begins_with(imported_dir_path + "/")) {
+		_log_lazy_internal_debug(vformat("[lazy-missing] skip (not project imported path): %s", p_internal_path));
 		return false;
 	}
 
 	String source_file;
 	if (!_find_source_for_internal_resource_recursive("res://", p_internal_path, source_file)) {
+		_log_lazy_internal_debug(vformat("[lazy-missing] source not found for internal path: %s", p_internal_path));
 		return false;
 	}
 
 	if (source_file.is_empty() || source_file == p_internal_path) {
+		_log_lazy_internal_debug(vformat("[lazy-missing] resolved source invalid: internal=%s source=%s", p_internal_path, source_file));
 		return false;
 	}
 
+	String lfs_oid;
+	int64_t lfs_declared_size = -1;
+	if (_is_git_lfs_pointer_file(source_file, lfs_oid, lfs_declared_size)) {
+		_log_lazy_internal_debug(vformat("[lazy-missing] source is Git LFS pointer (payload unavailable): source=%s oid=%s size=%s internal=%s", source_file, lfs_oid, String::num_int64(lfs_declared_size), p_internal_path));
+		return false;
+	}
+
+	_log_lazy_internal_debug(vformat("[lazy-missing] reimporting source=%s for missing internal=%s", source_file, p_internal_path));
 	missing_internal_resource_retry_in_progress = true;
 	const Error import_err = ResourceLoader::import(source_file);
 	missing_internal_resource_retry_in_progress = false;
+	if (import_err != OK) {
+		_log_lazy_internal_debug(vformat("[lazy-missing] reimport failed (%d): source=%s internal=%s", int(import_err), source_file, p_internal_path));
+	} else {
+		_log_lazy_internal_debug(vformat("[lazy-missing] reimport succeeded: source=%s internal=%s", source_file, p_internal_path));
+	}
 	return import_err == OK;
 }
 
@@ -447,7 +572,14 @@ Ref<Resource> ResourceLoader::_load(const String &p_path, const String &p_origin
 	}
 
 #ifdef TOOLS_ENABLED
+	String existing_variant_path;
+	if (_find_existing_internal_variant_path(p_path, existing_variant_path)) {
+		_log_lazy_internal_debug(vformat("[lazy-missing] trying existing fallback variant: missing=%s fallback=%s", p_path, existing_variant_path));
+		return _load(existing_variant_path, p_original_path, p_type_hint, p_cache_mode, r_error, p_use_sub_threads, r_progress);
+	}
+
 	if (_try_lazy_reimport_missing_internal_resource(p_path)) {
+		_log_lazy_internal_debug(vformat("[lazy-missing] retrying original path after reimport: %s", p_path));
 		return _load(p_path, p_original_path, p_type_hint, p_cache_mode, r_error, p_use_sub_threads, r_progress);
 	}
 
