@@ -371,7 +371,7 @@ class EditorFileSystem : public Node {
 	struct SceneGroupThreadData {
 		const String *scene_paths = nullptr;
 		SceneGroupUpdateResult *scene_group_results = nullptr;
-		Semaphore *scene_group_sem = nullptr;
+		bool debug_log_enabled = false;
 	};
 
 	struct ImportWorkResult {

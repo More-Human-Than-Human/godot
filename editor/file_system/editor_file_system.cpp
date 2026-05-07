@@ -2470,20 +2470,33 @@ void EditorFileSystem::_update_scene_group_thread(uint32_t p_index, SceneGroupTh
 	ERR_FAIL_NULL(p_update_data);
 	ERR_FAIL_NULL(p_update_data->scene_paths);
 	ERR_FAIL_NULL(p_update_data->scene_group_results);
-	ERR_FAIL_NULL(p_update_data->scene_group_sem);
 
 	ResourceLoader::set_is_import_thread(true);
 
 	SceneGroupUpdateResult &result = p_update_data->scene_group_results[p_index];
 	result.path = p_update_data->scene_paths[p_index];
+	const uint64_t start_time = OS::get_singleton()->get_ticks_msec();
+	if (p_update_data->debug_log_enabled) {
+		print_line(vformat("Scene groups worker start: %d %s", int(p_index), result.path));
+	}
+
 	result.file_exists = FileAccess::exists(result.path);
 	result.scene_groups.clear();
 	if (result.file_exists) {
 		result.scene_groups = PackedScene::get_scene_groups(result.path);
 	}
 
+	if (p_update_data->debug_log_enabled) {
+		const uint64_t duration_ms = OS::get_singleton()->get_ticks_msec() - start_time;
+		print_line(vformat("Scene groups worker done: %d %s (exists=%s, groups=%d, %d ms)",
+				int(p_index),
+				result.path,
+				result.file_exists ? "true" : "false",
+				result.scene_groups.size(),
+				int(duration_ms)));
+	}
+
 	ResourceLoader::set_is_import_thread(false);
-	p_update_data->scene_group_sem->post();
 }
 
 void EditorFileSystem::_update_scene_groups() {
@@ -2512,6 +2525,7 @@ void EditorFileSystem::_update_scene_groups() {
 
 	bool use_multiple_threads = false;
 	int scene_group_workers = 1;
+	bool scene_group_debug_log_enabled = false;
 	constexpr int MIN_SCENE_GROUP_PARALLEL_FILES = 16;
 
 #ifdef WEB_ENABLED
@@ -2526,17 +2540,18 @@ void EditorFileSystem::_update_scene_groups() {
 	const int worker_thread_pool_size = MAX(1, WorkerThreadPool::get_singleton()->get_thread_count());
 	const int worker_limit = MAX(1, worker_thread_pool_size - 1);
 	scene_group_workers = MIN(scene_group_parallel_update_max_workers, worker_limit);
+	scene_group_debug_log_enabled = bool(
+			GLOBAL_DEF("editor/import/experimental/scene_group_parallel_debug_log", false));
 	use_multiple_threads = enable_scene_group_parallel_update &&
 			scene_paths.size() >= MIN_SCENE_GROUP_PARALLEL_FILES &&
 			scene_group_workers > 1;
 #endif
 
 	if (use_multiple_threads) {
-		Semaphore scene_group_sem;
 		SceneGroupThreadData scene_group_thread_data;
 		scene_group_thread_data.scene_paths = scene_paths.ptr();
 		scene_group_thread_data.scene_group_results = scene_group_results.ptrw();
-		scene_group_thread_data.scene_group_sem = &scene_group_sem;
+		scene_group_thread_data.debug_log_enabled = scene_group_debug_log_enabled;
 
 		WorkerThreadPool::GroupID group_task = WorkerThreadPool::get_singleton()->add_template_group_task(
 				this,
@@ -2547,21 +2562,49 @@ void EditorFileSystem::_update_scene_groups() {
 				false,
 				TTR("Collect scene groups"));
 		if (group_task != WorkerThreadPool::INVALID_TASK_ID) {
-			int completed_count = 0;
+			int processed_count_reported = 0;
 			const int total_count = scene_paths.size();
-			while (completed_count < total_count) {
-				if (!scene_group_sem.try_wait()) {
-					OS::get_singleton()->delay_usec(1000);
-					continue;
+			uint64_t last_watchdog_msec = OS::get_singleton()->get_ticks_msec();
+			int last_watchdog_processed_count = 0;
+			while (!WorkerThreadPool::get_singleton()->is_group_task_completed(group_task)) {
+				const int processed_count = MIN(
+						total_count,
+						int(WorkerThreadPool::get_singleton()->get_group_processed_element_count(group_task)));
+				while (processed_count_reported < processed_count) {
+					processed_count_reported++;
+					if (ep) {
+						ep->step(vformat(TTR("Collecting scene groups... (%d/%d)"), processed_count_reported, total_count), processed_count_reported - 1, false);
+					}
 				}
 
-				completed_count++;
-				if (ep) {
-					ep->step(vformat(TTR("Collecting scene groups... (%d/%d)"), completed_count, total_count), completed_count - 1, false);
+				if (scene_group_debug_log_enabled) {
+					const uint64_t now_msec = OS::get_singleton()->get_ticks_msec();
+					if (now_msec - last_watchdog_msec >= 1000) {
+						if (processed_count == last_watchdog_processed_count) {
+							print_line(vformat("Scene groups stalled: processed=%d/%d, waiting on workers...",
+									processed_count, total_count));
+							if (processed_count < total_count) {
+								print_line(vformat("Scene groups next queued path: %s", scene_paths[processed_count]));
+							}
+						} else {
+							print_line(vformat("Scene groups parallel progress: processed=%d/%d",
+									processed_count, total_count));
+						}
+						last_watchdog_processed_count = processed_count;
+						last_watchdog_msec = now_msec;
+					}
 				}
+
+				OS::get_singleton()->delay_usec(1000);
 			}
 
 			WorkerThreadPool::get_singleton()->wait_for_group_task_completion(group_task);
+			while (processed_count_reported < total_count) {
+				processed_count_reported++;
+				if (ep) {
+					ep->step(vformat(TTR("Collecting scene groups... (%d/%d)"), processed_count_reported, total_count), processed_count_reported - 1, false);
+				}
+			}
 		} else {
 			for (int i = 0; i < scene_paths.size(); i++) {
 				SceneGroupUpdateResult &result = scene_group_results.write[i];
