@@ -65,6 +65,8 @@ namespace {
 static thread_local bool missing_internal_resource_retry_in_progress = false;
 
 static bool _import_file_references_internal_path(const String &p_import_file_path, const String &p_internal_path, String &r_source_file) {
+	const String import_source_candidate = p_import_file_path.trim_suffix(".import");
+
 	Error err;
 	Ref<FileAccess> f = FileAccess::open(p_import_file_path, FileAccess::READ, &err);
 	if (f.is_null()) {
@@ -98,21 +100,31 @@ static bool _import_file_references_internal_path(const String &p_import_file_pa
 		if (!assign.is_empty()) {
 			if ((assign == "path" || assign.begins_with("path.")) && String(value) == p_internal_path) {
 				path_match = true;
-				if (!r_source_file.is_empty()) {
-					return true;
-				}
 			} else if (assign == "source_file") {
 				r_source_file = value;
-				if (path_match) {
-					return true;
-				}
 			}
 		} else if (next_tag.name != "remap" && next_tag.name != "deps") {
 			break;
 		}
 	}
 
-	return path_match && !r_source_file.is_empty();
+	if (!path_match) {
+		return false;
+	}
+
+	String resolved_source = r_source_file;
+	if (resolved_source.is_empty() || !FileAccess::exists(resolved_source)) {
+		if (FileAccess::exists(import_source_candidate)) {
+			resolved_source = import_source_candidate;
+		}
+	}
+
+	if (resolved_source.is_empty()) {
+		return false;
+	}
+
+	r_source_file = resolved_source;
+	return true;
 }
 
 static bool _find_source_for_internal_resource_recursive(const String &p_dir_path, const String &p_internal_path, String &r_source_file) {
