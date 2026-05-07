@@ -1418,7 +1418,8 @@ void EditorFileSystem::_process_file_system(const ScannedDirectory *p_scan_dir, 
 
 				// Ensures backward compatibility when the project is loaded for the first time with the added import_md5
 				// and import_dest_paths properties in the file cache.
-				if (fc->import_md5.is_empty()) {
+				// Also repairs stale cache entries that may have missing destination paths.
+				if (fc->import_md5.is_empty() || (fc->import_dest_paths.is_empty() && FileAccess::exists(path + ".import"))) {
 					fi->import_md5 = FileAccess::get_md5(path + ".import");
 					fi->import_dest_paths = _get_import_dest_paths(path);
 				}
@@ -1456,9 +1457,9 @@ void EditorFileSystem::_process_file_system(const ScannedDirectory *p_scan_dir, 
 				ResourceFormatImporter::get_singleton()->get_resource_import_info(path, fi->type, fi->uid, fi->import_group_file);
 				fi->class_info = _get_global_script_class(fi->type, path);
 				fi->modified_time = 0;
-				fi->import_modified_time = 0;
+				fi->import_modified_time = import_mt;
 				fi->import_md5 = FileAccess::get_md5(path + ".import");
-				fi->import_dest_paths = Vector<String>();
+				fi->import_dest_paths = _get_import_dest_paths(path);
 				fi->import_valid = (fi->type == "TextFile" || fi->type == "OtherFile") ? true : ResourceLoader::is_import_valid(path);
 
 				if (lazy_reimport_on_scan) {
@@ -1675,10 +1676,17 @@ void EditorFileSystem::_scan_fs_changes(EditorFileSystemDirectory *p_dir, ScanPr
 					fi->file = f;
 
 					String path = cd.path_join(fi->file);
+					const bool can_import_file = _can_import_file(f);
 					fi->modified_time = FileAccess::get_modified_time(path);
-					fi->import_modified_time = 0;
-					fi->import_md5 = "";
-					fi->import_dest_paths = Vector<String>();
+					if (can_import_file) {
+						fi->import_modified_time = FileAccess::get_modified_time(path + ".import");
+						fi->import_md5 = FileAccess::get_md5(path + ".import");
+						fi->import_dest_paths = _get_import_dest_paths(path);
+					} else {
+						fi->import_modified_time = 0;
+						fi->import_md5 = "";
+						fi->import_dest_paths = Vector<String>();
+					}
 					fi->type = ResourceLoader::get_resource_type(path);
 					fi->resource_script_class = ResourceLoader::get_resource_script_class(path);
 					if (fi->type == "" && textfile_extensions.has(ext)) {
@@ -1700,7 +1708,7 @@ void EditorFileSystem::_scan_fs_changes(EditorFileSystemDirectory *p_dir, ScanPr
 						scan_actions.push_back(ia);
 					}
 
-					if (_can_import_file(f)) {
+					if (can_import_file) {
 						//if it can be imported, and it was added, it needs to be reimported
 						if (lazy_reimport_on_scan) {
 							if (fi->type.is_empty()) {
