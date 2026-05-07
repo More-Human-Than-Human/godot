@@ -183,6 +183,15 @@ static bool _is_scene_group_cache_candidate(const String &p_path) {
 	return extension == "tscn" || extension == "scn" || extension == "res" || extension == "tres";
 }
 
+static bool _has_missing_import_dest_files(const Vector<String> &p_dest_paths) {
+	for (const String &dest_path : p_dest_paths) {
+		if (!FileAccess::exists(dest_path)) {
+			return true;
+		}
+	}
+	return false;
+}
+
 } // namespace
 
 int EditorFileSystemDirectory::find_file_index(const String &p_file) const {
@@ -1428,9 +1437,13 @@ void EditorFileSystem::_process_file_system(const ScannedDirectory *p_scan_dir, 
 				// all the destination files still exist without reading the .import file.
 				// If something is different, we will queue a test for reimportation that will check
 				// the md5 of all files and import settings and, if necessary, execute a reimportation.
+				const bool missing_imported_files = reimport_on_missing_imported_files &&
+						_has_missing_import_dest_files(fi->import_dest_paths);
+				const bool import_settings_invalid = revalidate_import_files &&
+						!ResourceFormatImporter::get_singleton()->are_import_settings_valid(path);
 				if (_is_test_for_reimport_needed(path, fc->modification_time, mt, fc->import_modification_time, import_mt, fi->import_dest_paths) ||
-						(revalidate_import_files && !ResourceFormatImporter::get_singleton()->are_import_settings_valid(path))) {
-					if (!lazy_reimport_on_scan) {
+						import_settings_invalid) {
+					if (!lazy_reimport_on_scan || missing_imported_files) {
 						ItemAction ia;
 						ia.action = ItemAction::ACTION_FILE_TEST_REIMPORT;
 						ia.dir = p_dir;
@@ -1468,6 +1481,17 @@ void EditorFileSystem::_process_file_system(const ScannedDirectory *p_scan_dir, 
 						if (importer.is_valid()) {
 							fi->type = importer->get_resource_type();
 						}
+					}
+
+					// Even in lazy mode, force early reimport when cache artifacts are missing.
+					const bool missing_imported_files = reimport_on_missing_imported_files &&
+							_has_missing_import_dest_files(fi->import_dest_paths);
+					if (!fi->import_valid || fi->import_modified_time == 0 || fi->import_md5.is_empty() || missing_imported_files) {
+						ItemAction ia;
+						ia.action = ItemAction::ACTION_FILE_TEST_REIMPORT;
+						ia.dir = p_dir;
+						ia.file = fi->file;
+						scan_actions.push_back(ia);
 					}
 				} else {
 					ItemAction ia;
@@ -1717,6 +1741,16 @@ void EditorFileSystem::_scan_fs_changes(EditorFileSystemDirectory *p_dir, ScanPr
 									fi->type = importer->get_resource_type();
 								}
 							}
+
+							const bool missing_imported_files = reimport_on_missing_imported_files &&
+									_has_missing_import_dest_files(fi->import_dest_paths);
+							if (!fi->import_valid || fi->import_modified_time == 0 || fi->import_md5.is_empty() || missing_imported_files) {
+								ItemAction ia;
+								ia.action = ItemAction::ACTION_FILE_TEST_REIMPORT;
+								ia.dir = p_dir;
+								ia.file = f;
+								scan_actions.push_back(ia);
+							}
 						} else {
 							ItemAction ia;
 							ia.action = ItemAction::ACTION_FILE_TEST_REIMPORT;
@@ -1757,7 +1791,9 @@ void EditorFileSystem::_scan_fs_changes(EditorFileSystemDirectory *p_dir, ScanPr
 			uint64_t mt = FileAccess::get_modified_time(path);
 			uint64_t import_mt = FileAccess::get_modified_time(path + ".import");
 			if (_is_test_for_reimport_needed(path, p_dir->files[i]->modified_time, mt, p_dir->files[i]->import_modified_time, import_mt, p_dir->files[i]->import_dest_paths)) {
-				if (!lazy_reimport_on_scan) {
+				const bool missing_imported_files = reimport_on_missing_imported_files &&
+						_has_missing_import_dest_files(p_dir->files[i]->import_dest_paths);
+				if (!lazy_reimport_on_scan || missing_imported_files) {
 					ItemAction ia;
 					ia.action = ItemAction::ACTION_FILE_TEST_REIMPORT;
 					ia.dir = p_dir;
