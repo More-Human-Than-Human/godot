@@ -104,7 +104,7 @@ struct ImportScratchStack {
 static thread_local ImportScratchStack import_scratch_stack;
 
 static bool _is_import_timing_csv_enabled() {
-	return bool(GLOBAL_DEF("editor/import/experimental/write_import_timing_csv", false));
+	return bool(GLOBAL_GET("editor/import/experimental/write_import_timing_csv"));
 }
 
 class ImportScratchScope {
@@ -2673,15 +2673,15 @@ void EditorFileSystem::_update_scene_groups() {
 	use_multiple_threads = false;
 #elif defined(THREADS_ENABLED)
 	const bool enable_scene_group_parallel_update = bool(
-			GLOBAL_DEF("editor/import/experimental/enable_scene_group_parallel_update", true));
+			GLOBAL_GET("editor/import/experimental/enable_scene_group_parallel_update"));
 	int scene_group_parallel_update_max_workers = int(
-			GLOBAL_DEF("editor/import/experimental/scene_group_parallel_update_max_workers", 4));
+			GLOBAL_GET("editor/import/experimental/scene_group_parallel_update_max_workers"));
 	scene_group_parallel_update_max_workers = MAX(1, scene_group_parallel_update_max_workers);
 	const int worker_thread_pool_size = MAX(1, WorkerThreadPool::get_singleton()->get_thread_count());
 	const int worker_limit = MAX(1, worker_thread_pool_size - 1);
 	scene_group_workers = MIN(scene_group_parallel_update_max_workers, worker_limit);
 	scene_group_debug_log_enabled = bool(
-			GLOBAL_DEF("editor/import/experimental/scene_group_parallel_debug_log", false));
+			GLOBAL_GET("editor/import/experimental/scene_group_parallel_debug_log"));
 	use_multiple_threads = enable_scene_group_parallel_update &&
 			scene_paths.size() >= MIN_SCENE_GROUP_PARALLEL_FILES &&
 			scene_group_workers > 1;
@@ -3924,8 +3924,8 @@ void EditorFileSystem::reimport_files(const Vector<String> &p_files) {
 	importing = true;
 	_clear_import_work_results();
 
-	const bool enable_scene_parallel_reimport = bool(GLOBAL_DEF("editor/import/experimental/enable_scene_parallel_reimport", false));
-	int scene_parallel_reimport_max_workers = int(GLOBAL_DEF("editor/import/experimental/scene_parallel_reimport_max_workers", 2));
+	const bool enable_scene_parallel_reimport = bool(GLOBAL_GET("editor/import/experimental/enable_scene_parallel_reimport"));
+	int scene_parallel_reimport_max_workers = int(GLOBAL_GET("editor/import/experimental/scene_parallel_reimport_max_workers"));
 	scene_parallel_reimport_max_workers = MAX(1, scene_parallel_reimport_max_workers);
 
 	Vector<String> reloads;
