@@ -627,7 +627,6 @@ Ref<Resource> ResourceLoader::_load(const String &p_path, const String &p_origin
 #ifdef TOOLS_ENABLED
 	if (found &&
 			Engine::get_singleton()->is_editor_hint() &&
-			!Thread::is_main_thread() &&
 			r_error != nullptr &&
 			*r_error == ERR_FILE_NOT_FOUND &&
 			ResourceLoader::is_imported(p_path)) {
