@@ -1227,6 +1227,17 @@ bool _csproj_exists(const String &p_root_dir) {
 }
 #endif // TOOLS_ENABLED
 
+static bool _should_always_persist_project_setting(const StringName &p_name) {
+	const String key = p_name;
+	if (key.begins_with("editor/import/experimental/")) {
+		return true;
+	}
+
+	return key == "editor/import/use_multiple_threads" ||
+			key == "editor/import/lazy_reimport_on_scan" ||
+			key == "editor/import/lazy_reimport_on_load";
+}
+
 Error ProjectSettings::save_custom(const String &p_path, const CustomMap &p_custom, const Vector<String> &p_custom_features, bool p_merge_with_current) {
 	ERR_FAIL_COND_V_MSG(p_path.is_empty(), ERR_INVALID_PARAMETER, "Project settings save path cannot be empty.");
 
@@ -1279,7 +1290,7 @@ Error ProjectSettings::save_custom(const String &p_path, const CustomMap &p_cust
 			vc.order = v->order;
 			vc.type = v->variant.get_type();
 			vc.flags = PROPERTY_USAGE_EDITOR | PROPERTY_USAGE_STORAGE;
-			if (v->variant == v->initial) {
+			if (v->variant == v->initial && !_should_always_persist_project_setting(G.key)) {
 				continue;
 			}
 
