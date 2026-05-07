@@ -2472,6 +2472,8 @@ void EditorFileSystem::_update_scene_group_thread(uint32_t p_index, SceneGroupTh
 	ERR_FAIL_NULL(p_update_data->scene_group_results);
 	ERR_FAIL_NULL(p_update_data->scene_group_sem);
 
+	ResourceLoader::set_is_import_thread(true);
+
 	SceneGroupUpdateResult &result = p_update_data->scene_group_results[p_index];
 	result.path = p_update_data->scene_paths[p_index];
 	result.file_exists = FileAccess::exists(result.path);
@@ -2480,6 +2482,7 @@ void EditorFileSystem::_update_scene_group_thread(uint32_t p_index, SceneGroupTh
 		result.scene_groups = PackedScene::get_scene_groups(result.path);
 	}
 
+	ResourceLoader::set_is_import_thread(false);
 	p_update_data->scene_group_sem->post();
 }
 
