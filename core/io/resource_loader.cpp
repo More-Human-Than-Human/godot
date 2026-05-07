@@ -59,6 +59,139 @@ Ref<ResourceFormatLoader> ResourceLoader::loader[ResourceLoader::MAX_LOADERS];
 
 int ResourceLoader::loader_count = 0;
 
+#ifdef TOOLS_ENABLED
+namespace {
+
+static thread_local bool missing_internal_resource_retry_in_progress = false;
+
+static bool _import_file_references_internal_path(const String &p_import_file_path, const String &p_internal_path, String &r_source_file) {
+	Error err;
+	Ref<FileAccess> f = FileAccess::open(p_import_file_path, FileAccess::READ, &err);
+	if (f.is_null()) {
+		return false;
+	}
+
+	VariantParser::StreamFile stream;
+	stream.f = f;
+
+	String assign;
+	Variant value;
+	VariantParser::Tag next_tag;
+
+	int lines = 0;
+	String error_text;
+	bool path_match = false;
+
+	while (true) {
+		assign = Variant();
+		next_tag.fields.clear();
+		next_tag.name = String();
+
+		err = VariantParser::parse_tag_assign_eof(&stream, lines, error_text, next_tag, assign, value, nullptr, true);
+		if (err == ERR_FILE_EOF) {
+			break;
+		}
+		if (err != OK) {
+			return false;
+		}
+
+		if (!assign.is_empty()) {
+			if ((assign == "path" || assign.begins_with("path.")) && String(value) == p_internal_path) {
+				path_match = true;
+				if (!r_source_file.is_empty()) {
+					return true;
+				}
+			} else if (assign == "source_file") {
+				r_source_file = value;
+				if (path_match) {
+					return true;
+				}
+			}
+		} else if (next_tag.name != "remap" && next_tag.name != "deps") {
+			break;
+		}
+	}
+
+	return path_match && !r_source_file.is_empty();
+}
+
+static bool _find_source_for_internal_resource_recursive(const String &p_dir_path, const String &p_internal_path, String &r_source_file) {
+	Ref<DirAccess> dir = DirAccess::open(p_dir_path);
+	if (dir.is_null() || dir->list_dir_begin() != OK) {
+		return false;
+	}
+
+	const String project_data_path = ProjectSettings::get_singleton()->get_project_data_path();
+	bool found_match = false;
+	while (true) {
+		const String entry = dir->get_next();
+		if (entry.is_empty()) {
+			break;
+		}
+		if (entry == "." || entry == "..") {
+			continue;
+		}
+
+		const String entry_path = p_dir_path.path_join(entry);
+		if (dir->current_is_dir()) {
+			if (entry_path == project_data_path || entry_path.begins_with(project_data_path + "/")) {
+				continue;
+			}
+			if (_find_source_for_internal_resource_recursive(entry_path, p_internal_path, r_source_file)) {
+				found_match = true;
+				break;
+			}
+			continue;
+		}
+
+		if (!entry.ends_with(".import")) {
+			continue;
+		}
+
+		String source_file;
+		if (_import_file_references_internal_path(entry_path, p_internal_path, source_file)) {
+			r_source_file = source_file;
+			found_match = true;
+			break;
+		}
+	}
+
+	dir->list_dir_end();
+	return found_match;
+}
+
+static bool _try_lazy_reimport_missing_internal_resource(const String &p_internal_path) {
+	if (!Engine::get_singleton()->is_editor_hint() ||
+			!bool(GLOBAL_GET("editor/import/lazy_reimport_on_load")) ||
+			ResourceLoader::import == nullptr ||
+			missing_internal_resource_retry_in_progress ||
+			!Thread::is_main_thread()) {
+		return false;
+	}
+
+	const String imported_dir_path = ProjectSettings::get_singleton()->get_project_data_path().path_join("imported");
+	if (!p_internal_path.begins_with(imported_dir_path + "/")) {
+		return false;
+	}
+
+	String source_file;
+	if (!_find_source_for_internal_resource_recursive("res://", p_internal_path, source_file)) {
+		return false;
+	}
+
+	if (source_file.is_empty() || source_file == p_internal_path) {
+		return false;
+	}
+
+	missing_internal_resource_retry_in_progress = true;
+	const Error import_err = ResourceLoader::import(source_file);
+	missing_internal_resource_retry_in_progress = false;
+	return import_err == OK;
+}
+
+} // namespace
+#endif // TOOLS_ENABLED
+
 bool ResourceFormatLoader::recognize_path(const String &p_path, const String &p_for_type) const {
 	bool ret = false;
 	if (GDVIRTUAL_CALL(_recognize_path, p_path, p_for_type, ret)) {
@@ -302,6 +435,10 @@ Ref<Resource> ResourceLoader::_load(const String &p_path, const String &p_origin
 	}
 
 #ifdef TOOLS_ENABLED
+	if (_try_lazy_reimport_missing_internal_resource(p_path)) {
+		return _load(p_path, p_original_path, p_type_hint, p_cache_mode, r_error, p_use_sub_threads, r_progress);
+	}
+
 	if (Engine::get_singleton()->is_editor_hint()) {
 		if (ResourceFormatImporter::get_singleton()->get_importer_by_file(p_path).is_valid()) {
 			// The format is known to the editor, but the file hasn't been imported
