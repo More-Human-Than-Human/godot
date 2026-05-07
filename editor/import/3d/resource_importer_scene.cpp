@@ -30,12 +30,15 @@
 
 #include "resource_importer_scene.h"
 
+#include "core/config/project_settings.h"
 #include "core/error/error_macros.h"
+#include "core/io/file_access.h"
 #include "core/io/dir_access.h"
 #include "core/io/resource_loader.h"
 #include "core/io/resource_saver.h"
 #include "core/object/class_db.h"
 #include "core/object/script_language.h"
+#include "core/os/os.h"
 #include "core/os/thread.h"
 #include "editor/editor_interface.h"
 #include "editor/editor_node.h"
@@ -61,6 +64,60 @@
 #include "scene/resources/packed_scene.h"
 #include "scene/resources/physics_material.h"
 #include "scene/resources/resource_format_text.h"
+
+namespace {
+
+static Ref<Resource> _externalize_to_shared_import_cache(const Ref<Resource> &p_resource, const String &p_prefix, const String &p_extension) {
+	if (p_resource.is_null()) {
+		return p_resource;
+	}
+
+	const String imported_root = ProjectSettings::get_singleton()->get_imported_files_path();
+	const String shared_dir = imported_root.path_join("shared");
+	const String tmp_dir = shared_dir.path_join("_tmp");
+	const String shared_prefix = shared_dir.path_join(p_prefix + "-");
+	const String current_path = p_resource->get_path();
+
+	if (current_path.begins_with(shared_prefix)) {
+		return p_resource;
+	}
+
+	const Error mk_err = DirAccess::make_dir_recursive_absolute(ProjectSettings::get_singleton()->globalize_path(tmp_dir));
+	if (mk_err != OK) {
+		return p_resource;
+	}
+
+	const String tmp_path = tmp_dir.path_join(vformat("%s-%s-%s%s", p_prefix, itos(uint64_t(Thread::get_caller_id())), itos(OS::get_singleton()->get_ticks_usec()), p_extension));
+	if (ResourceSaver::save(p_resource, tmp_path) != OK) {
+		return p_resource;
+	}
+
+	const String fingerprint = FileAccess::get_md5(tmp_path);
+	if (fingerprint.is_empty()) {
+		DirAccess::remove_absolute(ProjectSettings::get_singleton()->globalize_path(tmp_path));
+		return p_resource;
+	}
+
+	const String shared_path = shared_dir.path_join(vformat("%s-%s%s", p_prefix, fingerprint, p_extension));
+	if (!FileAccess::exists(shared_path)) {
+		const String tmp_abs = ProjectSettings::get_singleton()->globalize_path(tmp_path);
+		const String shared_abs = ProjectSettings::get_singleton()->globalize_path(shared_path);
+		if (DirAccess::rename_absolute(tmp_abs, shared_abs) != OK) {
+			if (DirAccess::copy_absolute(tmp_abs, shared_abs) != OK) {
+				DirAccess::remove_absolute(tmp_abs);
+				return p_resource;
+			}
+			DirAccess::remove_absolute(tmp_abs);
+		}
+	} else {
+		DirAccess::remove_absolute(ProjectSettings::get_singleton()->globalize_path(tmp_path));
+	}
+
+	Ref<Resource> shared_resource = ResourceLoader::load(shared_path, p_resource->get_class(), ResourceFormatLoader::CACHE_MODE_REPLACE);
+	return shared_resource.is_valid() ? shared_resource : p_resource;
+}
+
+} // namespace
 
 void EditorSceneFormatImporter::get_extensions(List<String> *r_extensions) const {
 	Vector<String> arr;
@@ -1468,6 +1525,7 @@ Node *ResourceImporterScene::_post_fix_node(Node *p_node, Node *p_root, HashMap<
 	if (p_options.has("materials/extract")) {
 		extract_mat = p_options["materials/extract"];
 	}
+	const bool use_shared_material_cache = bool(GLOBAL_GET("editor/import/scene/use_shared_material_cache"));
 
 	String spath = p_source_file.get_base_dir();
 	if (p_options.has("materials/extract_path")) {
@@ -1707,6 +1765,14 @@ Node *ResourceImporterScene::_post_fix_node(Node *p_node, Node *p_root, HashMap<
 								}
 							}
 							matdata["use_external/fallback_path"] = external_mat->get_path();
+						}
+					}
+
+					if (extract_mat == 0 && use_shared_material_cache && !(matdata.has("use_external/enabled") && bool(matdata["use_external/enabled"]))) {
+						Ref<Material> current_material = m->get_surface_material(i);
+						Ref<Material> shared_material = _externalize_to_shared_import_cache(current_material, "material", ".res");
+						if (shared_material.is_valid()) {
+							m->set_surface_material(i, shared_material);
 						}
 					}
 				}
@@ -2750,6 +2816,7 @@ Array ResourceImporterScene::_get_skinned_pose_transforms(ImporterMeshInstance3D
 }
 
 Node *ResourceImporterScene::_generate_meshes(Node *p_node, const Dictionary &p_mesh_data, bool p_generate_lods, bool p_create_shadow_meshes, LightBakeMode p_light_bake_mode, float p_lightmap_texel_size, const Vector<uint8_t> &p_src_lightmap_cache, Vector<Vector<uint8_t>> &r_lightmap_caches) {
+	const bool use_shared_mesh_cache = bool(GLOBAL_GET("editor/import/scene/use_shared_mesh_cache"));
 	ImporterMeshInstance3D *src_mesh_node = Object::cast_to<ImporterMeshInstance3D>(p_node);
 	if (src_mesh_node) {
 		//is mesh
@@ -2763,6 +2830,7 @@ Node *ResourceImporterScene::_generate_meshes(Node *p_node, const Dictionary &p_
 		Ref<ImporterMesh> importer_mesh = src_mesh_node->get_mesh();
 		if (importer_mesh.is_valid()) {
 			Ref<ArrayMesh> mesh;
+			bool mesh_saved_to_file = false;
 			if (!importer_mesh->has_mesh()) {
 				//do mesh processing
 
@@ -2892,6 +2960,7 @@ Node *ResourceImporterScene::_generate_meshes(Node *p_node, const Dictionary &p_
 					}
 
 					mesh->set_path(save_res_path, true); //takeover existing, if needed
+					mesh_saved_to_file = true;
 
 				} else {
 					mesh = importer_mesh->get_mesh();
@@ -2901,6 +2970,12 @@ Node *ResourceImporterScene::_generate_meshes(Node *p_node, const Dictionary &p_
 			}
 
 			if (mesh.is_valid()) {
+				if (use_shared_mesh_cache && !mesh_saved_to_file && mesh->get_path().is_empty()) {
+					Ref<ArrayMesh> shared_mesh = _externalize_to_shared_import_cache(mesh, "mesh", ".res");
+					if (shared_mesh.is_valid()) {
+						mesh = shared_mesh;
+					}
+				}
 				_copy_meta(importer_mesh.ptr(), mesh.ptr());
 				mesh_node->set_mesh(mesh);
 				for (int i = 0; i < mesh->get_surface_count(); i++) {
