@@ -124,6 +124,60 @@ public:
 	}
 };
 
+struct ImportedCacheEntry {
+	String path;
+	uint64_t modified_time = 0;
+	uint64_t size = 0;
+	bool referenced = false;
+
+	bool operator<(const ImportedCacheEntry &p_other) const {
+		// Trim unreferenced files first. For equal priority, trim oldest first.
+		if (referenced != p_other.referenced) {
+			return referenced < p_other.referenced;
+		}
+		return modified_time < p_other.modified_time;
+	}
+};
+
+static void _collect_imported_cache_entries(const String &p_dir_path, const HashSet<String> &p_referenced_files, Vector<ImportedCacheEntry> &r_entries, uint64_t &r_total_size) {
+	Ref<DirAccess> dir = DirAccess::open(p_dir_path);
+	if (dir.is_null() || dir->list_dir_begin() != OK) {
+		return;
+	}
+
+	while (true) {
+		const String file_name = dir->get_next();
+		if (file_name.is_empty()) {
+			break;
+		}
+
+		if (file_name == "." || file_name == "..") {
+			continue;
+		}
+
+		const String file_path = p_dir_path.path_join(file_name);
+		if (dir->current_is_dir()) {
+			_collect_imported_cache_entries(file_path, p_referenced_files, r_entries, r_total_size);
+			continue;
+		}
+
+		const int64_t file_size = FileAccess::get_size(file_path);
+		if (file_size < 0) {
+			continue;
+		}
+
+		ImportedCacheEntry entry;
+		entry.path = file_path;
+		entry.size = file_size;
+		entry.modified_time = FileAccess::get_modified_time(file_path);
+		entry.referenced = p_referenced_files.has(file_path);
+		r_total_size += entry.size;
+		r_entries.push_back(entry);
+	}
+
+	dir->list_dir_end();
+}
+
 } // namespace
 
 int EditorFileSystemDirectory::find_file_index(const String &p_file) const {
@@ -1211,6 +1265,7 @@ void EditorFileSystem::scan() {
 		new_filesystem = nullptr;
 		_update_scan_actions();
 		_cleanup_orphan_imported_files();
+		_cleanup_imported_cache_budget();
 		// Update all icons so they are loaded for the FileSystemDock.
 		_update_files_icon_path();
 		scanning = false;
@@ -1785,6 +1840,47 @@ void EditorFileSystem::_cleanup_orphan_imported_files() {
 	dir->list_dir_end();
 }
 
+void EditorFileSystem::_cleanup_imported_cache_budget() {
+	if (!filesystem) {
+		return;
+	}
+
+	const int64_t max_size_mb = int64_t(GLOBAL_GET("editor/import/cache_max_size_mb"));
+	if (max_size_mb <= 0) {
+		return;
+	}
+
+	const uint64_t max_size_bytes = uint64_t(max_size_mb) * 1024 * 1024;
+	const String imported_files_path = ProjectSettings::get_singleton()->get_imported_files_path();
+
+	HashSet<String> referenced_files;
+	_collect_imported_files(filesystem, referenced_files);
+
+	Vector<ImportedCacheEntry> entries;
+	uint64_t total_size = 0;
+	_collect_imported_cache_entries(imported_files_path, referenced_files, entries, total_size);
+	if (total_size <= max_size_bytes || entries.is_empty()) {
+		return;
+	}
+
+	const bool evict_referenced = bool(GLOBAL_GET("editor/import/cache_evict_referenced_files"));
+	entries.sort();
+
+	for (const ImportedCacheEntry &entry : entries) {
+		if (total_size <= max_size_bytes) {
+			break;
+		}
+		if (entry.referenced && !evict_referenced) {
+			continue;
+		}
+
+		const Error remove_err = DirAccess::remove_absolute(ProjectSettings::get_singleton()->globalize_path(entry.path));
+		if (remove_err == OK) {
+			total_size -= entry.size;
+		}
+	}
+}
+
 int EditorFileSystem::_insert_actions_delete_files_directory(EditorFileSystemDirectory *p_dir) {
 	int nb_files = 0;
 	for (EditorFileSystemDirectory::FileInfo *fi : p_dir->files) {
@@ -1869,6 +1965,7 @@ void EditorFileSystem::scan_changes() {
 			_scan_fs_changes(filesystem, sp);
 			const bool changed = _update_scan_actions();
 			_cleanup_orphan_imported_files();
+			_cleanup_imported_cache_budget();
 			if (changed) {
 				emit_signal(SNAME("filesystem_changed"));
 			}
@@ -1931,6 +2028,7 @@ void EditorFileSystem::_notification(int p_what) {
 						}
 						const bool changed = _update_scan_actions();
 						_cleanup_orphan_imported_files();
+						_cleanup_imported_cache_budget();
 						// Set first_scan to false before the signals so the function doing_first_scan can return false
 						// in editor_node to start the export if needed.
 						first_scan = false;
@@ -1951,6 +2049,7 @@ void EditorFileSystem::_notification(int p_what) {
 					thread.wait_to_finish();
 					_update_scan_actions();
 					_cleanup_orphan_imported_files();
+					_cleanup_imported_cache_budget();
 					// Update all icons so they are loaded for the FileSystemDock.
 					_update_files_icon_path();
 					// Set first_scan to false before the signals so the function doing_first_scan can return false
