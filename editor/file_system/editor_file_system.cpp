@@ -102,6 +102,9 @@ struct ImportScratchStack {
 };
 
 static thread_local ImportScratchStack import_scratch_stack;
+static Mutex lazy_reimport_in_flight_mutex;
+static HashSet<String> lazy_reimport_in_flight_paths;
+static SafeNumeric<uint64_t> reimport_task_sequence{ 0 };
 
 static bool _is_import_timing_csv_enabled() {
 	return bool(GLOBAL_GET("editor/import/experimental/write_import_timing_csv"));
@@ -3931,8 +3934,10 @@ void EditorFileSystem::reimport_files(const Vector<String> &p_files) {
 	Vector<String> reloads;
 	constexpr int PREPARE_PROGRESS_STEP_INTERVAL = 32;
 	constexpr int IMPORT_PROGRESS_STEP_INTERVAL = 1;
+	const String reimport_task = "reimport_" + String::num_uint64(reimport_task_sequence.increment());
+	const String reimport_post_task = reimport_task + "_post";
 
-	EditorProgress *ep = memnew(EditorProgress("reimport", TTR("(Re)Importing Assets"), p_files.size()));
+	EditorProgress *ep = memnew(EditorProgress(reimport_task, TTR("(Re)Importing Assets"), p_files.size()));
 
 	// The method reimport_files runs on the main thread, and if VSync is enabled
 	// or Update Continuously is disabled, Main::Iteration takes longer each frame.
@@ -4187,7 +4192,7 @@ void EditorFileSystem::reimport_files(const Vector<String> &p_files) {
 
 	importing = false;
 
-	ep = memnew(EditorProgress("reimport", TTR("(Re)Importing Assets"), p_files.size()));
+	ep = memnew(EditorProgress(reimport_post_task, TTR("(Re)Importing Assets"), p_files.size()));
 	ep->step(TTR("Executing post-reimport operations..."), 0, true);
 	if (!is_scanning()) {
 		emit_signal(SNAME("filesystem_changed"));
@@ -4222,13 +4227,30 @@ Error EditorFileSystem::reimport_append(const String &p_file, const HashMap<Stri
 }
 
 Error EditorFileSystem::_resource_import(const String &p_path) {
-	Vector<String> files;
-	files.push_back(p_path);
+	ERR_FAIL_NULL_V(singleton, ERR_UNCONFIGURED);
+
+	{
+		MutexLock lock(lazy_reimport_in_flight_mutex);
+		if (lazy_reimport_in_flight_paths.has(p_path)) {
+			print_verbose(vformat("EditorFileSystem: lazy reimport already in flight for %s, joining existing request.", p_path));
+			return OK;
+		}
+		lazy_reimport_in_flight_paths.insert(p_path);
+	}
 
 	singleton->update_file(p_path);
-	singleton->reimport_files(files);
+	const Error import_error = singleton->reimport_append(p_path, HashMap<StringName, Variant>(), String(), Variant());
 
-	return OK;
+	{
+		MutexLock lock(lazy_reimport_in_flight_mutex);
+		lazy_reimport_in_flight_paths.erase(p_path);
+	}
+
+	if (import_error != OK) {
+		print_verbose(vformat("EditorFileSystem: lazy reimport failed for %s (%d).", p_path, int(import_error)));
+	}
+
+	return import_error;
 }
 
 Ref<Resource> EditorFileSystem::_load_resource_on_startup(ResourceFormatImporter *p_importer, const String &p_path, Error *r_error, bool p_use_sub_threads, float *r_progress, ResourceLoaderConstants::CacheMode p_cache_mode) {
