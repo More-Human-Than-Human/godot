@@ -693,7 +693,10 @@ void EditorFileSystem::_thread_func(void *_userdata) {
 	sd->_scan_filesystem();
 }
 
-bool EditorFileSystem::_is_test_for_reimport_needed(const String &p_path, uint64_t p_last_modification_time, uint64_t p_modification_time, uint64_t p_last_import_modification_time, uint64_t p_import_modification_time, const Vector<String> &p_import_dest_paths) {
+bool EditorFileSystem::_is_test_for_reimport_needed(const String &p_path, uint64_t p_last_modification_time, uint64_t p_modification_time, uint64_t p_last_import_modification_time, uint64_t p_import_modification_time, const Vector<String> &p_import_dest_paths, bool *r_missing_imported_dest_files) {
+	if (r_missing_imported_dest_files) {
+		*r_missing_imported_dest_files = false;
+	}
 	// The idea here is to trust the cache. If the last modification times in the cache correspond
 	// to the last modification times of the files on disk, it means the files have not changed since
 	// the last import, and the files in .godot/imported (p_import_dest_paths) should all be valid.
@@ -706,6 +709,9 @@ bool EditorFileSystem::_is_test_for_reimport_needed(const String &p_path, uint64
 	if (reimport_on_missing_imported_files) {
 		for (const String &path : p_import_dest_paths) {
 			if (!FileAccess::exists(path)) {
+				if (r_missing_imported_dest_files) {
+					*r_missing_imported_dest_files = true;
+				}
 				return true;
 			}
 		}
@@ -1433,9 +1439,10 @@ void EditorFileSystem::_process_file_system(const ScannedDirectory *p_scan_dir, 
 				// the md5 of all files and import settings and, if necessary, execute a reimportation.
 				const bool import_settings_invalid = revalidate_import_files &&
 						!ResourceFormatImporter::get_singleton()->are_import_settings_valid(path);
-				if (_is_test_for_reimport_needed(path, fc->modification_time, mt, fc->import_modification_time, import_mt, fi->import_dest_paths) ||
+				bool missing_imported_dest_files = false;
+				if (_is_test_for_reimport_needed(path, fc->modification_time, mt, fc->import_modification_time, import_mt, fi->import_dest_paths, &missing_imported_dest_files) ||
 						import_settings_invalid) {
-					if (!lazy_reimport_on_scan) {
+					if (!lazy_reimport_on_scan || missing_imported_dest_files) {
 						ItemAction ia;
 						ia.action = ItemAction::ACTION_FILE_TEST_REIMPORT;
 						ia.dir = p_dir;
@@ -1761,8 +1768,9 @@ void EditorFileSystem::_scan_fs_changes(EditorFileSystemDirectory *p_dir, ScanPr
 			// each time the user switch back to Godot.
 			uint64_t mt = FileAccess::get_modified_time(path);
 			uint64_t import_mt = FileAccess::get_modified_time(path + ".import");
-			if (_is_test_for_reimport_needed(path, p_dir->files[i]->modified_time, mt, p_dir->files[i]->import_modified_time, import_mt, p_dir->files[i]->import_dest_paths)) {
-				if (!lazy_reimport_on_scan) {
+			bool missing_imported_dest_files = false;
+			if (_is_test_for_reimport_needed(path, p_dir->files[i]->modified_time, mt, p_dir->files[i]->import_modified_time, import_mt, p_dir->files[i]->import_dest_paths, &missing_imported_dest_files)) {
+				if (!lazy_reimport_on_scan || missing_imported_dest_files) {
 					ItemAction ia;
 					ia.action = ItemAction::ACTION_FILE_TEST_REIMPORT;
 					ia.dir = p_dir;

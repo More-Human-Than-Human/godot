@@ -41,6 +41,7 @@
 #include "core/object/message_queue.h"
 #include "core/object/script_language.h"
 #include "core/os/condition_variable.h"
+#include "core/os/mutex.h"
 #include "core/os/os.h"
 #include "core/os/safe_binary_mutex.h"
 #include "core/string/print_string.h"
@@ -63,6 +64,7 @@ int ResourceLoader::loader_count = 0;
 namespace {
 
 static thread_local bool missing_internal_resource_retry_in_progress = false;
+static Mutex lazy_missing_internal_lfs_warned_sources_mutex;
 static HashSet<String> lazy_missing_internal_lfs_warned_sources;
 
 static bool _is_lazy_internal_debug_log_enabled() {
@@ -319,10 +321,13 @@ static bool _try_lazy_reimport_missing_internal_resource(const String &p_interna
 	String lfs_oid;
 	int64_t lfs_declared_size = -1;
 	if (_is_git_lfs_pointer_file(source_file, lfs_oid, lfs_declared_size)) {
-		if (!lazy_missing_internal_lfs_warned_sources.has(source_file)) {
-			lazy_missing_internal_lfs_warned_sources.insert(source_file);
-			WARN_PRINT(vformat("Lazy missing-internal recovery skipped for %s: source asset is a Git LFS pointer without payload (%s, oid=%s, expected_size=%s). Pull LFS content for this asset to regenerate the imported texture.",
-					p_internal_path, source_file, lfs_oid, String::num_int64(lfs_declared_size)));
+		{
+			MutexLock lock(lazy_missing_internal_lfs_warned_sources_mutex);
+			if (!lazy_missing_internal_lfs_warned_sources.has(source_file)) {
+				lazy_missing_internal_lfs_warned_sources.insert(source_file);
+				WARN_PRINT(vformat("Lazy missing-internal recovery skipped for %s: source asset is a Git LFS pointer without payload (%s, oid=%s, expected_size=%s). Pull LFS content for this asset to regenerate the imported texture.",
+						p_internal_path, source_file, lfs_oid, String::num_int64(lfs_declared_size)));
+			}
 		}
 		_log_lazy_internal_debug(vformat("[lazy-missing] source is Git LFS pointer (payload unavailable): source=%s oid=%s size=%s internal=%s", source_file, lfs_oid, String::num_int64(lfs_declared_size), p_internal_path));
 		return false;
