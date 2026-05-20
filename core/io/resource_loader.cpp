@@ -66,9 +66,13 @@ namespace {
 static thread_local bool missing_internal_resource_retry_in_progress = false;
 static Mutex lazy_missing_internal_lfs_warned_sources_mutex;
 static HashSet<String> lazy_missing_internal_lfs_warned_sources;
+static Mutex lazy_missing_internal_deferred_mutex;
+static HashSet<String> lazy_missing_internal_deferred_paths;
 static Mutex lazy_missing_internal_source_cache_mutex;
 static HashMap<String, String> lazy_missing_internal_source_cache;
 static bool lazy_missing_internal_source_cache_built = false;
+
+static bool _try_lazy_reimport_missing_internal_resource(const String &p_internal_path);
 
 static bool _is_lazy_internal_debug_log_enabled() {
 	if (!ProjectSettings::get_singleton()) {
@@ -356,6 +360,19 @@ static void _ensure_lazy_missing_internal_source_cache() {
 	lazy_missing_internal_source_cache_built = true;
 }
 
+static void _process_deferred_lazy_missing_internal_reimport(const String &p_internal_path) {
+	{
+		MutexLock lock(lazy_missing_internal_deferred_mutex);
+		lazy_missing_internal_deferred_paths.erase(p_internal_path);
+	}
+
+	if (FileAccess::exists(p_internal_path)) {
+		return;
+	}
+
+	_try_lazy_reimport_missing_internal_resource(p_internal_path);
+}
+
 static bool _find_source_for_internal_resource_recursive(const String &p_dir_path, const String &p_internal_path, String &r_source_file) {
 	Ref<DirAccess> dir = DirAccess::open(p_dir_path);
 	if (dir.is_null() || dir->list_dir_begin() != OK) {
@@ -419,7 +436,27 @@ static bool _try_lazy_reimport_missing_internal_resource(const String &p_interna
 		return false;
 	}
 	if (!Thread::is_main_thread()) {
-		_log_lazy_internal_debug(vformat("[lazy-missing] skip (not main thread): %s", p_internal_path));
+		bool queued = false;
+		{
+			MutexLock lock(lazy_missing_internal_deferred_mutex);
+			if (!lazy_missing_internal_deferred_paths.has(p_internal_path)) {
+				lazy_missing_internal_deferred_paths.insert(p_internal_path);
+				queued = true;
+			}
+		}
+		if (queued) {
+			CallQueue *main_queue = MessageQueue::get_main_singleton();
+			if (main_queue) {
+				main_queue->push_callable(callable_mp_static(_process_deferred_lazy_missing_internal_reimport).bind(p_internal_path));
+				_log_lazy_internal_debug(vformat("[lazy-missing] queued deferred reimport on main thread: %s", p_internal_path));
+			} else {
+				MutexLock lock(lazy_missing_internal_deferred_mutex);
+				lazy_missing_internal_deferred_paths.erase(p_internal_path);
+				_log_lazy_internal_debug(vformat("[lazy-missing] skip (main queue unavailable): %s", p_internal_path));
+			}
+		} else {
+			_log_lazy_internal_debug(vformat("[lazy-missing] deferred reimport already queued (not main thread): %s", p_internal_path));
+		}
 		return false;
 	}
 
