@@ -694,6 +694,8 @@ void EditorFileSystem::_thread_func(void *_userdata) {
 }
 
 bool EditorFileSystem::_is_test_for_reimport_needed(const String &p_path, uint64_t p_last_modification_time, uint64_t p_modification_time, uint64_t p_last_import_modification_time, uint64_t p_import_modification_time, const Vector<String> &p_import_dest_paths, bool *r_missing_imported_dest_files) {
+	(void)p_import_dest_paths;
+
 	if (r_missing_imported_dest_files) {
 		*r_missing_imported_dest_files = false;
 	}
@@ -707,13 +709,14 @@ bool EditorFileSystem::_is_test_for_reimport_needed(const String &p_path, uint64
 		return true;
 	}
 	if (reimport_on_missing_imported_files) {
-		for (const String &path : p_import_dest_paths) {
-			if (!FileAccess::exists(path)) {
-				if (r_missing_imported_dest_files) {
-					*r_missing_imported_dest_files = true;
-				}
-				return true;
+		// Only require the currently selected internal import target to exist.
+		// Other import variants may be absent by design and should not force full-project reimports.
+		const String internal_path = ResourceFormatImporter::get_singleton()->get_internal_resource_path(p_path);
+		if (!internal_path.is_empty() && !FileAccess::exists(internal_path)) {
+			if (r_missing_imported_dest_files) {
+				*r_missing_imported_dest_files = true;
 			}
+			return true;
 		}
 	}
 	return false;
