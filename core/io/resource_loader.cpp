@@ -66,6 +66,9 @@ namespace {
 static thread_local bool missing_internal_resource_retry_in_progress = false;
 static Mutex lazy_missing_internal_lfs_warned_sources_mutex;
 static HashSet<String> lazy_missing_internal_lfs_warned_sources;
+static Mutex lazy_missing_internal_source_cache_mutex;
+static HashMap<String, String> lazy_missing_internal_source_cache;
+static bool lazy_missing_internal_source_cache_built = false;
 
 static bool _is_lazy_internal_debug_log_enabled() {
 	if (!ProjectSettings::get_singleton()) {
@@ -234,6 +237,125 @@ static bool _import_file_references_internal_path(const String &p_import_file_pa
 	return true;
 }
 
+static bool _read_import_file_internal_paths(const String &p_import_file_path, Vector<String> &r_internal_paths, String &r_source_file) {
+	r_internal_paths.clear();
+	r_source_file = String();
+
+	const String import_source_candidate = p_import_file_path.trim_suffix(".import");
+
+	Error err;
+	Ref<FileAccess> f = FileAccess::open(p_import_file_path, FileAccess::READ, &err);
+	if (f.is_null()) {
+		return false;
+	}
+
+	VariantParser::StreamFile stream;
+	stream.f = f;
+
+	String assign;
+	Variant value;
+	VariantParser::Tag next_tag;
+
+	int lines = 0;
+	String error_text;
+
+	while (true) {
+		assign = Variant();
+		next_tag.fields.clear();
+		next_tag.name = String();
+
+		err = VariantParser::parse_tag_assign_eof(&stream, lines, error_text, next_tag, assign, value, nullptr, true);
+		if (err == ERR_FILE_EOF) {
+			break;
+		}
+		if (err != OK) {
+			return false;
+		}
+
+		if (!assign.is_empty()) {
+			if (assign == "path" || assign.begins_with("path.")) {
+				r_internal_paths.push_back(String(value));
+			} else if (assign == "source_file") {
+				r_source_file = value;
+			}
+		} else if (next_tag.name != "remap" && next_tag.name != "deps") {
+			break;
+		}
+	}
+
+	if (r_source_file.is_empty() || !FileAccess::exists(r_source_file)) {
+		if (FileAccess::exists(import_source_candidate)) {
+			r_source_file = import_source_candidate;
+		}
+	}
+
+	return !r_internal_paths.is_empty() && !r_source_file.is_empty();
+}
+
+static void _register_import_file_internal_paths(const String &p_import_file_path) {
+	Vector<String> internal_paths;
+	String source_file;
+	if (!_read_import_file_internal_paths(p_import_file_path, internal_paths, source_file)) {
+		return;
+	}
+
+	MutexLock lock(lazy_missing_internal_source_cache_mutex);
+	for (const String &internal_path : internal_paths) {
+		if (!lazy_missing_internal_source_cache.has(internal_path)) {
+			lazy_missing_internal_source_cache.insert(internal_path, source_file);
+		}
+	}
+}
+
+static void _build_lazy_missing_internal_source_cache_recursive(const String &p_dir_path) {
+	Ref<DirAccess> dir = DirAccess::open(p_dir_path);
+	if (dir.is_null() || dir->list_dir_begin() != OK) {
+		return;
+	}
+
+	const String project_data_path = ProjectSettings::get_singleton()->get_project_data_path();
+	while (true) {
+		const String entry = dir->get_next();
+		if (entry.is_empty()) {
+			break;
+		}
+		if (entry == "." || entry == "..") {
+			continue;
+		}
+
+		const String entry_path = p_dir_path.path_join(entry);
+		if (dir->current_is_dir()) {
+			if (entry_path == project_data_path || entry_path.begins_with(project_data_path + "/")) {
+				continue;
+			}
+			_build_lazy_missing_internal_source_cache_recursive(entry_path);
+			continue;
+		}
+
+		if (!entry.ends_with(".import")) {
+			continue;
+		}
+
+		_register_import_file_internal_paths(entry_path);
+	}
+
+	dir->list_dir_end();
+}
+
+static void _ensure_lazy_missing_internal_source_cache() {
+	{
+		MutexLock lock(lazy_missing_internal_source_cache_mutex);
+		if (lazy_missing_internal_source_cache_built) {
+			return;
+		}
+	}
+
+	_build_lazy_missing_internal_source_cache_recursive("res://");
+
+	MutexLock lock(lazy_missing_internal_source_cache_mutex);
+	lazy_missing_internal_source_cache_built = true;
+}
+
 static bool _find_source_for_internal_resource_recursive(const String &p_dir_path, const String &p_internal_path, String &r_source_file) {
 	Ref<DirAccess> dir = DirAccess::open(p_dir_path);
 	if (dir.is_null() || dir->list_dir_begin() != OK) {
@@ -308,7 +430,20 @@ static bool _try_lazy_reimport_missing_internal_resource(const String &p_interna
 	}
 
 	String source_file;
-	if (!_find_source_for_internal_resource_recursive("res://", p_internal_path, source_file)) {
+	_ensure_lazy_missing_internal_source_cache();
+	{
+		MutexLock lock(lazy_missing_internal_source_cache_mutex);
+		if (const String *cached_source = lazy_missing_internal_source_cache.getptr(p_internal_path)) {
+			source_file = *cached_source;
+		}
+	}
+
+	if (source_file.is_empty() && _find_source_for_internal_resource_recursive("res://", p_internal_path, source_file)) {
+		MutexLock lock(lazy_missing_internal_source_cache_mutex);
+		lazy_missing_internal_source_cache.insert(p_internal_path, source_file);
+	}
+
+	if (source_file.is_empty()) {
 		_log_lazy_internal_debug(vformat("[lazy-missing] source not found for internal path: %s", p_internal_path));
 		return false;
 	}
