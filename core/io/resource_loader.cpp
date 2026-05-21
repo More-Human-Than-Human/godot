@@ -71,7 +71,6 @@ static HashSet<String> lazy_missing_internal_deferred_paths;
 static Mutex lazy_missing_internal_source_cache_mutex;
 static HashMap<String, String> lazy_missing_internal_source_cache;
 static bool lazy_missing_internal_source_cache_built = false;
-static const uint64_t lazy_missing_internal_deferred_wait_timeout_usec = 5 * 1000 * 1000;
 
 static bool _try_lazy_reimport_missing_internal_resource(const String &p_internal_path);
 
@@ -94,15 +93,9 @@ static bool _is_lazy_missing_internal_deferred_pending(const String &p_internal_
 }
 
 static bool _wait_for_deferred_lazy_missing_internal_reimport(const String &p_internal_path) {
-	const uint64_t start_usec = OS::get_singleton()->get_ticks_usec();
 	while (_is_lazy_missing_internal_deferred_pending(p_internal_path)) {
 		if (FileAccess::exists(p_internal_path)) {
 			return true;
-		}
-		if (OS::get_singleton()->get_ticks_usec() - start_usec >= lazy_missing_internal_deferred_wait_timeout_usec) {
-			_log_lazy_internal_debug(vformat("[lazy-missing] deferred reimport wait timed out after %d ms: %s",
-					int(lazy_missing_internal_deferred_wait_timeout_usec / 1000), p_internal_path));
-			return false;
 		}
 		OS::get_singleton()->delay_usec(1000);
 	}
