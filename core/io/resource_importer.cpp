@@ -270,7 +270,20 @@ bool ResourceFormatImporter::exists(const String &p_path) const {
 }
 
 bool ResourceFormatImporter::recognize_path(const String &p_path, const String &p_for_type) const {
-	return FileAccess::exists(p_path + ".import");
+	if (FileAccess::exists(p_path + ".import")) {
+		return true;
+	}
+
+#ifdef TOOLS_ENABLED
+	if (Engine::get_singleton() &&
+			Engine::get_singleton()->is_editor_hint() &&
+			bool(GLOBAL_GET("editor/import/lazy_reimport_on_load")) &&
+			get_importer_by_file(p_path).is_valid()) {
+		return true;
+	}
+#endif
+
+	return false;
 }
 
 Error ResourceFormatImporter::get_import_order_threads_and_importer(const String &p_path, int &r_order, bool &r_can_threads, String &r_importer) const {

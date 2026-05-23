@@ -1477,7 +1477,8 @@ void EditorFileSystem::_process_file_system(const ScannedDirectory *p_scan_dir, 
 				fi->import_dest_paths = _get_import_dest_paths(path);
 				fi->import_valid = (fi->type == "TextFile" || fi->type == "OtherFile") ? true : ResourceLoader::is_import_valid(path);
 
-				if (lazy_reimport_on_scan) {
+				const bool has_import_sidecar = FileAccess::exists(path + ".import");
+				if (lazy_reimport_on_scan && has_import_sidecar) {
 					if (fi->type.is_empty()) {
 						Ref<ResourceImporter> importer = ResourceFormatImporter::get_singleton()->get_importer_by_file(path);
 						if (importer.is_valid()) {
@@ -1724,8 +1725,9 @@ void EditorFileSystem::_scan_fs_changes(EditorFileSystemDirectory *p_dir, ScanPr
 					}
 
 					if (can_import_file) {
+						const bool has_import_sidecar = FileAccess::exists(path + ".import");
 						//if it can be imported, and it was added, it needs to be reimported
-						if (lazy_reimport_on_scan) {
+						if (lazy_reimport_on_scan && has_import_sidecar) {
 							if (fi->type.is_empty()) {
 								Ref<ResourceImporter> importer = ResourceFormatImporter::get_singleton()->get_importer_by_file(path);
 								if (importer.is_valid()) {
