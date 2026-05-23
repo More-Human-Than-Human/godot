@@ -3217,20 +3217,28 @@ Node *ResourceImporterScene::pre_import(const String &p_source_file, const HashM
 	}
 
 	ERR_FAIL_COND_V(importer.is_null(), nullptr);
-	ERR_FAIL_COND_V(p_options.is_empty(), nullptr);
+
+	HashMap<StringName, Variant> import_options(p_options);
+	if (import_options.is_empty()) {
+		List<ImportOption> options;
+		get_import_options(p_source_file, &options);
+		for (const ImportOption &E : options) {
+			import_options[E.option.name] = E.default_value;
+		}
+	}
 
 	Error err = OK;
 
-	Node *scene = importer->import_scene(p_source_file, EditorSceneFormatImporter::IMPORT_ANIMATION | EditorSceneFormatImporter::IMPORT_GENERATE_TANGENT_ARRAYS | EditorSceneFormatImporter::IMPORT_FORCE_DISABLE_MESH_COMPRESSION, p_options, nullptr, &err);
+	Node *scene = importer->import_scene(p_source_file, EditorSceneFormatImporter::IMPORT_ANIMATION | EditorSceneFormatImporter::IMPORT_GENERATE_TANGENT_ARRAYS | EditorSceneFormatImporter::IMPORT_FORCE_DISABLE_MESH_COMPRESSION, import_options, nullptr, &err);
 	if (!scene || err != OK) {
 		return nullptr;
 	}
 
-	_pre_fix_global(scene, p_options);
+	_pre_fix_global(scene, import_options);
 
 	HashMap<Ref<ImporterMesh>, Vector<Ref<Shape3D>>> collision_map;
 	List<Pair<NodePath, Node *>> node_renames;
-	_pre_fix_node(scene, scene, collision_map, nullptr, node_renames, p_options);
+	_pre_fix_node(scene, scene, collision_map, nullptr, node_renames, import_options);
 
 	return scene;
 }

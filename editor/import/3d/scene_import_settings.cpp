@@ -798,6 +798,14 @@ void SceneImportSettingsDialog::open_settings(const String &p_path, const String
 		}
 	}
 
+	if (defaults.is_empty()) {
+		List<ResourceImporter::ImportOption> options;
+		_resource_importer_scene->get_import_options(p_path, &options);
+		for (const ResourceImporter::ImportOption &E : options) {
+			defaults[E.option.name] = E.default_value;
+		}
+	}
+
 	// Regardless of p_scene_import_type, use PackedScene for pre_import because we want to see the full thing.
 	_resource_importer_scene->set_scene_import_type("PackedScene");
 	scene = _resource_importer_scene->pre_import(p_path, defaults);
