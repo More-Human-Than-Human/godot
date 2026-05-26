@@ -1443,11 +1443,12 @@ void EditorFileSystem::_process_file_system(const ScannedDirectory *p_scan_dir, 
 				const bool import_settings_invalid = revalidate_import_files &&
 						!ResourceFormatImporter::get_singleton()->are_import_settings_valid(path);
 				bool missing_imported_dest_files = false;
+				const bool lazy_reimport_enabled = lazy_reimport_on_scan || lazy_reimport_on_load;
 				if (_is_test_for_reimport_needed(path, fc->modification_time, mt, fc->import_modification_time, import_mt, fi->import_dest_paths, &missing_imported_dest_files) ||
 						import_settings_invalid) {
 					// If lazy-on-load is enabled, missing outputs can be regenerated on demand.
 					const bool force_eager_for_missing_outputs = missing_imported_dest_files && !lazy_reimport_on_load;
-					if (!lazy_reimport_on_scan || force_eager_for_missing_outputs) {
+					if (!lazy_reimport_enabled || force_eager_for_missing_outputs) {
 						ItemAction ia;
 						ia.action = ItemAction::ACTION_FILE_TEST_REIMPORT;
 						ia.dir = p_dir;
@@ -1480,7 +1481,8 @@ void EditorFileSystem::_process_file_system(const ScannedDirectory *p_scan_dir, 
 				fi->import_valid = (fi->type == "TextFile" || fi->type == "OtherFile") ? true : ResourceLoader::is_import_valid(path);
 
 				const bool has_import_sidecar = FileAccess::exists(path + ".import");
-				if (lazy_reimport_on_scan && has_import_sidecar) {
+				const bool lazy_reimport_enabled = lazy_reimport_on_scan || lazy_reimport_on_load;
+				if (lazy_reimport_enabled && has_import_sidecar) {
 					if (fi->type.is_empty()) {
 						Ref<ResourceImporter> importer = ResourceFormatImporter::get_singleton()->get_importer_by_file(path);
 						if (importer.is_valid()) {
@@ -1729,7 +1731,8 @@ void EditorFileSystem::_scan_fs_changes(EditorFileSystemDirectory *p_dir, ScanPr
 					if (can_import_file) {
 						const bool has_import_sidecar = FileAccess::exists(path + ".import");
 						//if it can be imported, and it was added, it needs to be reimported
-						if (lazy_reimport_on_scan && has_import_sidecar) {
+						const bool lazy_reimport_enabled = lazy_reimport_on_scan || lazy_reimport_on_load;
+						if (lazy_reimport_enabled && has_import_sidecar) {
 							if (fi->type.is_empty()) {
 								Ref<ResourceImporter> importer = ResourceFormatImporter::get_singleton()->get_importer_by_file(path);
 								if (importer.is_valid()) {
@@ -1776,10 +1779,11 @@ void EditorFileSystem::_scan_fs_changes(EditorFileSystemDirectory *p_dir, ScanPr
 			uint64_t mt = FileAccess::get_modified_time(path);
 			uint64_t import_mt = FileAccess::get_modified_time(path + ".import");
 			bool missing_imported_dest_files = false;
+			const bool lazy_reimport_enabled = lazy_reimport_on_scan || lazy_reimport_on_load;
 			if (_is_test_for_reimport_needed(path, p_dir->files[i]->modified_time, mt, p_dir->files[i]->import_modified_time, import_mt, p_dir->files[i]->import_dest_paths, &missing_imported_dest_files)) {
 				// If lazy-on-load is enabled, missing outputs can be regenerated on demand.
 				const bool force_eager_for_missing_outputs = missing_imported_dest_files && !lazy_reimport_on_load;
-				if (!lazy_reimport_on_scan || force_eager_for_missing_outputs) {
+				if (!lazy_reimport_enabled || force_eager_for_missing_outputs) {
 					ItemAction ia;
 					ia.action = ItemAction::ACTION_FILE_TEST_REIMPORT;
 					ia.dir = p_dir;
