@@ -87,22 +87,6 @@ static void _log_lazy_internal_debug(const String &p_message) {
 	}
 }
 
-static bool _is_lazy_missing_internal_deferred_pending(const String &p_internal_path) {
-	MutexLock lock(lazy_missing_internal_deferred_mutex);
-	return lazy_missing_internal_deferred_paths.has(p_internal_path);
-}
-
-static bool _wait_for_deferred_lazy_missing_internal_reimport(const String &p_internal_path) {
-	while (_is_lazy_missing_internal_deferred_pending(p_internal_path)) {
-		if (FileAccess::exists(p_internal_path)) {
-			return true;
-		}
-		OS::get_singleton()->delay_usec(1000);
-	}
-
-	return FileAccess::exists(p_internal_path);
-}
-
 static bool _is_git_lfs_pointer_file(const String &p_path, String &r_oid, int64_t &r_declared_size) {
 	r_oid = String();
 	r_declared_size = -1;
@@ -473,10 +457,8 @@ static bool _try_lazy_reimport_missing_internal_resource(const String &p_interna
 		} else {
 			_log_lazy_internal_debug(vformat("[lazy-missing] deferred reimport already queued (not main thread): %s", p_internal_path));
 		}
-		if (_wait_for_deferred_lazy_missing_internal_reimport(p_internal_path)) {
-			_log_lazy_internal_debug(vformat("[lazy-missing] deferred reimport completed, internal now exists: %s", p_internal_path));
-			return true;
-		}
+		// Avoid blocking caller threads while a burst of missing internals is being recovered.
+		// The resource will be retried on a subsequent load attempt after reimport completes.
 		return false;
 	}
 
