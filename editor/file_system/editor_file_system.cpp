@@ -4218,8 +4218,13 @@ Error EditorFileSystem::reimport_append(const String &p_file, const HashMap<Stri
 	Vector<String> reloads;
 	reloads.append(p_file);
 
-	// Emit the resource_reimporting signal for the single file before the actual importation.
-	emit_signal(SNAME("resources_reimporting"), reloads);
+	// Worker-thread lazy reimport can hit this path while scene batch reimport is running.
+	// Defer signal emission to avoid calling Node::emit_signalp() from non-main threads.
+	if (Thread::is_main_thread()) {
+		emit_signal(SNAME("resources_reimporting"), reloads);
+	} else {
+		call_deferred(SNAME("emit_signal"), SNAME("resources_reimporting"), reloads);
+	}
 
 	int worker_thread_pool_size = 1;
 #if defined(THREADS_ENABLED)
@@ -4234,8 +4239,12 @@ Error EditorFileSystem::reimport_append(const String &p_file, const HashMap<Stri
 	_record_import_timing(p_file, importer_name, "asset", duration_ms, false, ret, 1, worker_thread_pool_size, 1);
 	_flush_import_timing_csv();
 
-	// Emit the resource_reimported signal for the single file we just reimported.
-	emit_signal(SNAME("resources_reimported"), reloads);
+	// Same thread-safety rule as above.
+	if (Thread::is_main_thread()) {
+		emit_signal(SNAME("resources_reimported"), reloads);
+	} else {
+		call_deferred(SNAME("emit_signal"), SNAME("resources_reimported"), reloads);
+	}
 	return ret;
 }
 
