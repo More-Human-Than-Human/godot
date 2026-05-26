@@ -36,6 +36,15 @@
 #include "scene/resources/bit_map.h"
 #include "servers/rendering/rendering_server.h"
 
+static _FORCE_INLINE_ void *_encode_detect_callback_userdata(ObjectID p_object_id) {
+	return reinterpret_cast<void *>(static_cast<uintptr_t>(static_cast<uint64_t>(p_object_id)));
+}
+
+static _FORCE_INLINE_ CompressedTexture2D *_decode_detect_callback_userdata(void *p_userdata) {
+	const ObjectID object_id = ObjectID(static_cast<uint64_t>(reinterpret_cast<uintptr_t>(p_userdata)));
+	return ObjectDB::get_instance<CompressedTexture2D>(object_id);
+}
+
 Error CompressedTexture2D::_load_data(const String &p_path, int &r_width, int &r_height, Ref<Image> &image, bool &r_request_3d, bool &r_request_normal, bool &r_request_roughness, int &mipmap_limit, int p_size_limit) {
 	alpha_cache.unref();
 
@@ -101,21 +110,30 @@ void CompressedTexture2D::set_path(const String &p_path, bool p_take_over) {
 }
 
 void CompressedTexture2D::_requested_3d(void *p_ud) {
-	CompressedTexture2D *ct = (CompressedTexture2D *)p_ud;
+	CompressedTexture2D *ct = _decode_detect_callback_userdata(p_ud);
+	if (ct == nullptr) {
+		return;
+	}
 	Ref<CompressedTexture2D> ctex(ct);
 	ERR_FAIL_NULL(request_3d_callback);
 	request_3d_callback(ctex);
 }
 
 void CompressedTexture2D::_requested_roughness(void *p_ud, const String &p_normal_path, RSE::TextureDetectRoughnessChannel p_roughness_channel) {
-	CompressedTexture2D *ct = (CompressedTexture2D *)p_ud;
+	CompressedTexture2D *ct = _decode_detect_callback_userdata(p_ud);
+	if (ct == nullptr) {
+		return;
+	}
 	Ref<CompressedTexture2D> ctex(ct);
 	ERR_FAIL_NULL(request_roughness_callback);
 	request_roughness_callback(ctex, p_normal_path, p_roughness_channel);
 }
 
 void CompressedTexture2D::_requested_normal(void *p_ud) {
-	CompressedTexture2D *ct = (CompressedTexture2D *)p_ud;
+	CompressedTexture2D *ct = _decode_detect_callback_userdata(p_ud);
+	if (ct == nullptr) {
+		return;
+	}
 	Ref<CompressedTexture2D> ctex(ct);
 	ERR_FAIL_NULL(request_normal_callback);
 	request_normal_callback(ctex);
@@ -168,7 +186,7 @@ Error CompressedTexture2D::load(const String &p_path) {
 
 	if (request_3d) {
 		//print_line("request detect 3D at " + p_path);
-		RS::get_singleton()->texture_set_detect_3d_callback(texture, _requested_3d, this);
+		RS::get_singleton()->texture_set_detect_3d_callback(texture, _requested_3d, _encode_detect_callback_userdata(get_instance_id()));
 	} else {
 		//print_line("not requesting detect 3D at " + p_path);
 		RS::get_singleton()->texture_set_detect_3d_callback(texture, nullptr, nullptr);
@@ -176,7 +194,7 @@ Error CompressedTexture2D::load(const String &p_path) {
 
 	if (request_roughness) {
 		//print_line("request detect srgb at " + p_path);
-		RS::get_singleton()->texture_set_detect_roughness_callback(texture, _requested_roughness, this);
+		RS::get_singleton()->texture_set_detect_roughness_callback(texture, _requested_roughness, _encode_detect_callback_userdata(get_instance_id()));
 	} else {
 		//print_line("not requesting detect srgb at " + p_path);
 		RS::get_singleton()->texture_set_detect_roughness_callback(texture, nullptr, nullptr);
@@ -184,7 +202,7 @@ Error CompressedTexture2D::load(const String &p_path) {
 
 	if (request_normal) {
 		//print_line("request detect srgb at " + p_path);
-		RS::get_singleton()->texture_set_detect_normal_callback(texture, _requested_normal, this);
+		RS::get_singleton()->texture_set_detect_normal_callback(texture, _requested_normal, _encode_detect_callback_userdata(get_instance_id()));
 	} else {
 		//print_line("not requesting detect normal at " + p_path);
 		RS::get_singleton()->texture_set_detect_normal_callback(texture, nullptr, nullptr);
