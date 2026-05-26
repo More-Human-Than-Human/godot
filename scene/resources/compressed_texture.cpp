@@ -462,6 +462,10 @@ void CompressedTexture2D::_bind_methods() {
 CompressedTexture2D::~CompressedTexture2D() {
 	if (texture.is_valid()) {
 		ERR_FAIL_NULL(RenderingServer::get_singleton());
+		// Prevent late detect callbacks from calling into a texture object that is being destroyed.
+		RS::get_singleton()->texture_set_detect_3d_callback(texture, nullptr, nullptr);
+		RS::get_singleton()->texture_set_detect_roughness_callback(texture, nullptr, nullptr);
+		RS::get_singleton()->texture_set_detect_normal_callback(texture, nullptr, nullptr);
 		RS::get_singleton()->free_rid(texture);
 	}
 }
