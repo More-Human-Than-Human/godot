@@ -1145,6 +1145,19 @@ bool EditorFileSystem::_update_scan_actions() {
 				ERR_CONTINUE(idx == -1);
 				String full_path = ia.dir->get_file_path(idx);
 
+				const bool lazy_reimport_enabled = lazy_reimport_on_scan || lazy_reimport_on_load;
+				if (lazy_reimport_enabled) {
+					// In lazy mode, avoid eager scan-time imports and trust on-demand import on load.
+					ia.dir->files[idx]->modified_time = FileAccess::get_modified_time(full_path);
+					ia.dir->files[idx]->import_modified_time = FileAccess::get_modified_time(full_path + ".import");
+					if (ia.dir->files[idx]->import_md5.is_empty()) {
+						ia.dir->files[idx]->import_md5 = FileAccess::get_md5(full_path + ".import");
+					}
+					ia.dir->files[idx]->import_dest_paths = _get_import_dest_paths(full_path);
+					fs_changed = true;
+					break;
+				}
+
 				bool need_reimport = _test_for_reimport(full_path, ia.dir->files[idx]->import_md5);
 				if (need_reimport) {
 					// Must reimport.
