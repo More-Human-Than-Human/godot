@@ -41,7 +41,9 @@
 #include "scene/resources/compressed_texture.h"
 
 void ResourceImporterTexture::_texture_reimport_roughness(const Ref<CompressedTexture2D> &p_tex, const String &p_normal_path, RSE::TextureDetectRoughnessChannel p_channel) {
-	ERR_FAIL_COND(p_tex.is_null());
+	if (p_tex.is_null() || singleton == nullptr) {
+		return;
+	}
 
 	MutexLock lock(singleton->mutex);
 	StringName path = p_tex->get_path();
@@ -56,7 +58,9 @@ void ResourceImporterTexture::_texture_reimport_roughness(const Ref<CompressedTe
 }
 
 void ResourceImporterTexture::_texture_reimport_3d(const Ref<CompressedTexture2D> &p_tex) {
-	ERR_FAIL_COND(p_tex.is_null());
+	if (p_tex.is_null() || singleton == nullptr) {
+		return;
+	}
 
 	MutexLock lock(singleton->mutex);
 	StringName path = p_tex->get_path();
@@ -69,7 +73,9 @@ void ResourceImporterTexture::_texture_reimport_3d(const Ref<CompressedTexture2D
 }
 
 void ResourceImporterTexture::_texture_reimport_normal(const Ref<CompressedTexture2D> &p_tex) {
-	ERR_FAIL_COND(p_tex.is_null());
+	if (p_tex.is_null() || singleton == nullptr) {
+		return;
+	}
 
 	MutexLock lock(singleton->mutex);
 	StringName path = p_tex->get_path();

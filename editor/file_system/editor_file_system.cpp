@@ -1446,8 +1446,8 @@ void EditorFileSystem::_process_file_system(const ScannedDirectory *p_scan_dir, 
 				const bool lazy_reimport_enabled = lazy_reimport_on_scan || lazy_reimport_on_load;
 				if (_is_test_for_reimport_needed(path, fc->modification_time, mt, fc->import_modification_time, import_mt, fi->import_dest_paths, &missing_imported_dest_files) ||
 						import_settings_invalid) {
-					// If lazy-on-load is enabled, missing outputs can be regenerated on demand.
-					const bool force_eager_for_missing_outputs = missing_imported_dest_files && !lazy_reimport_on_load;
+					// Missing outputs should only force eager scan reimport when all lazy modes are disabled.
+					const bool force_eager_for_missing_outputs = missing_imported_dest_files && !lazy_reimport_enabled;
 					if (!lazy_reimport_enabled || force_eager_for_missing_outputs) {
 						ItemAction ia;
 						ia.action = ItemAction::ACTION_FILE_TEST_REIMPORT;
@@ -1781,8 +1781,8 @@ void EditorFileSystem::_scan_fs_changes(EditorFileSystemDirectory *p_dir, ScanPr
 			bool missing_imported_dest_files = false;
 			const bool lazy_reimport_enabled = lazy_reimport_on_scan || lazy_reimport_on_load;
 			if (_is_test_for_reimport_needed(path, p_dir->files[i]->modified_time, mt, p_dir->files[i]->import_modified_time, import_mt, p_dir->files[i]->import_dest_paths, &missing_imported_dest_files)) {
-				// If lazy-on-load is enabled, missing outputs can be regenerated on demand.
-				const bool force_eager_for_missing_outputs = missing_imported_dest_files && !lazy_reimport_on_load;
+				// Missing outputs should only force eager scan reimport when all lazy modes are disabled.
+				const bool force_eager_for_missing_outputs = missing_imported_dest_files && !lazy_reimport_enabled;
 				if (!lazy_reimport_enabled || force_eager_for_missing_outputs) {
 					ItemAction ia;
 					ia.action = ItemAction::ACTION_FILE_TEST_REIMPORT;
@@ -4225,13 +4225,16 @@ void EditorFileSystem::reimport_files(const Vector<String> &p_files) {
 Error EditorFileSystem::reimport_append(const String &p_file, const HashMap<StringName, Variant> &p_custom_options, const String &p_custom_importer, Variant p_generator_parameters) {
 	Vector<String> reloads;
 	reloads.append(p_file);
+	const bool emit_signals = !is_importing();
 
 	// Worker-thread lazy reimport can hit this path while scene batch reimport is running.
-	// Defer signal emission to avoid calling Node::emit_signalp() from non-main threads.
-	if (Thread::is_main_thread()) {
-		emit_signal(SNAME("resources_reimporting"), reloads);
-	} else {
-		call_deferred(SNAME("emit_signal"), SNAME("resources_reimporting"), reloads);
+	// Skip per-file signals during global import batches to avoid mid-import editor reloads.
+	if (emit_signals) {
+		if (Thread::is_main_thread()) {
+			emit_signal(SNAME("resources_reimporting"), reloads);
+		} else {
+			call_deferred(SNAME("emit_signal"), SNAME("resources_reimporting"), reloads);
+		}
 	}
 
 	int worker_thread_pool_size = 1;
@@ -4248,10 +4251,12 @@ Error EditorFileSystem::reimport_append(const String &p_file, const HashMap<Stri
 	_flush_import_timing_csv();
 
 	// Same thread-safety rule as above.
-	if (Thread::is_main_thread()) {
-		emit_signal(SNAME("resources_reimported"), reloads);
-	} else {
-		call_deferred(SNAME("emit_signal"), SNAME("resources_reimported"), reloads);
+	if (emit_signals) {
+		if (Thread::is_main_thread()) {
+			emit_signal(SNAME("resources_reimported"), reloads);
+		} else {
+			call_deferred(SNAME("emit_signal"), SNAME("resources_reimported"), reloads);
+		}
 	}
 	return ret;
 }
