@@ -4286,7 +4286,9 @@ Error EditorFileSystem::_resource_import(const String &p_path) {
 		lazy_reimport_in_flight_paths.insert(p_path);
 	}
 
-	singleton->update_file(p_path);
+	if (Thread::is_main_thread()) {
+		singleton->update_file(p_path);
+	}
 	const Error import_error = singleton->reimport_append(p_path, HashMap<StringName, Variant>(), String(), Variant());
 
 	{
