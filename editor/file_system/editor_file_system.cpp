@@ -1445,7 +1445,9 @@ void EditorFileSystem::_process_file_system(const ScannedDirectory *p_scan_dir, 
 				bool missing_imported_dest_files = false;
 				if (_is_test_for_reimport_needed(path, fc->modification_time, mt, fc->import_modification_time, import_mt, fi->import_dest_paths, &missing_imported_dest_files) ||
 						import_settings_invalid) {
-					if (!lazy_reimport_on_scan || missing_imported_dest_files) {
+					// If lazy-on-load is enabled, missing outputs can be regenerated on demand.
+					const bool force_eager_for_missing_outputs = missing_imported_dest_files && !lazy_reimport_on_load;
+					if (!lazy_reimport_on_scan || force_eager_for_missing_outputs) {
 						ItemAction ia;
 						ia.action = ItemAction::ACTION_FILE_TEST_REIMPORT;
 						ia.dir = p_dir;
@@ -1775,7 +1777,9 @@ void EditorFileSystem::_scan_fs_changes(EditorFileSystemDirectory *p_dir, ScanPr
 			uint64_t import_mt = FileAccess::get_modified_time(path + ".import");
 			bool missing_imported_dest_files = false;
 			if (_is_test_for_reimport_needed(path, p_dir->files[i]->modified_time, mt, p_dir->files[i]->import_modified_time, import_mt, p_dir->files[i]->import_dest_paths, &missing_imported_dest_files)) {
-				if (!lazy_reimport_on_scan || missing_imported_dest_files) {
+				// If lazy-on-load is enabled, missing outputs can be regenerated on demand.
+				const bool force_eager_for_missing_outputs = missing_imported_dest_files && !lazy_reimport_on_load;
+				if (!lazy_reimport_on_scan || force_eager_for_missing_outputs) {
 					ItemAction ia;
 					ia.action = ItemAction::ACTION_FILE_TEST_REIMPORT;
 					ia.dir = p_dir;
@@ -4612,6 +4616,7 @@ EditorFileSystem::EditorFileSystem() {
 	ResourceLoader::import = _resource_import;
 	reimport_on_missing_imported_files = GLOBAL_GET("editor/import/reimport_missing_imported_files");
 	lazy_reimport_on_scan = GLOBAL_GET("editor/import/lazy_reimport_on_scan");
+	lazy_reimport_on_load = GLOBAL_GET("editor/import/lazy_reimport_on_load");
 	singleton = this;
 	filesystem = memnew(EditorFileSystemDirectory); //like, empty
 	filesystem->parent = nullptr;
