@@ -65,6 +65,7 @@ int ResourceLoader::loader_count = 0;
 namespace {
 
 static thread_local bool missing_internal_resource_retry_in_progress = false;
+static thread_local Vector<String> lazy_missing_internal_load_stack;
 static Mutex lazy_missing_internal_lfs_warned_sources_mutex;
 static HashSet<String> lazy_missing_internal_lfs_warned_sources;
 static Mutex lazy_missing_internal_in_flight_sources_mutex;
@@ -72,13 +73,33 @@ static HashSet<String> lazy_missing_internal_in_flight_sources;
 static Mutex lazy_missing_internal_source_cache_mutex;
 static HashMap<String, String> lazy_missing_internal_source_cache;
 static bool lazy_missing_internal_source_cache_built = false;
+static Mutex lazy_missing_internal_replacement_cache_mutex;
+static HashMap<String, String> lazy_missing_internal_replacement_cache;
+
+struct LazyMissingInternalLoadScope {
+	LazyMissingInternalLoadScope(const String &p_path) {
+		lazy_missing_internal_load_stack.push_back(p_path);
+	}
+
+	~LazyMissingInternalLoadScope() {
+		DEV_ASSERT(!lazy_missing_internal_load_stack.is_empty());
+		lazy_missing_internal_load_stack.remove_at(lazy_missing_internal_load_stack.size() - 1);
+	}
+
+	String get_referrer_path() const {
+		if (lazy_missing_internal_load_stack.size() < 2) {
+			return String();
+		}
+		return lazy_missing_internal_load_stack[lazy_missing_internal_load_stack.size() - 2];
+	}
+};
 
 struct LazyMissingInternalImportTaskData {
 	String source_file;
 	String internal_path;
 };
 
-static bool _try_lazy_reimport_missing_internal_resource(const String &p_internal_path);
+static bool _try_lazy_reimport_missing_internal_resource(const String &p_internal_path, const String &p_referrer_path, const String &p_type_hint, String *r_retry_path);
 
 static bool _is_lazy_internal_debug_log_enabled() {
 	if (!ProjectSettings::get_singleton()) {
@@ -141,36 +162,55 @@ static bool _find_existing_internal_variant_path(const String &p_internal_path, 
 	if (!p_internal_path.begins_with(imported_dir_path + "/")) {
 		return false;
 	}
-	if (!p_internal_path.ends_with(".ctex")) {
+
+	if (p_internal_path.ends_with(".ctex")) {
+		String base_path = p_internal_path;
+		Vector<String> candidate_suffixes;
+		if (p_internal_path.ends_with(".s3tc.ctex")) {
+			base_path = p_internal_path.trim_suffix(".s3tc.ctex");
+			candidate_suffixes = { ".bptc.ctex", ".etc2.ctex", ".astc.ctex", ".ctex" };
+		} else if (p_internal_path.ends_with(".bptc.ctex")) {
+			base_path = p_internal_path.trim_suffix(".bptc.ctex");
+			candidate_suffixes = { ".s3tc.ctex", ".etc2.ctex", ".astc.ctex", ".ctex" };
+		} else if (p_internal_path.ends_with(".etc2.ctex")) {
+			base_path = p_internal_path.trim_suffix(".etc2.ctex");
+			candidate_suffixes = { ".astc.ctex", ".s3tc.ctex", ".bptc.ctex", ".ctex" };
+		} else if (p_internal_path.ends_with(".astc.ctex")) {
+			base_path = p_internal_path.trim_suffix(".astc.ctex");
+			candidate_suffixes = { ".etc2.ctex", ".s3tc.ctex", ".bptc.ctex", ".ctex" };
+		}
+
+		for (const String &suffix : candidate_suffixes) {
+			const String candidate_path = base_path + suffix;
+			if (FileAccess::exists(candidate_path)) {
+				r_variant_path = candidate_path;
+				return true;
+			}
+		}
+	}
+
+	Ref<DirAccess> dir = DirAccess::open(p_internal_path.get_base_dir());
+	if (dir.is_null() || dir->list_dir_begin() != OK) {
 		return false;
 	}
 
-	String base_path = p_internal_path;
-	Vector<String> candidate_suffixes;
-	if (p_internal_path.ends_with(".s3tc.ctex")) {
-		base_path = p_internal_path.trim_suffix(".s3tc.ctex");
-		candidate_suffixes = { ".bptc.ctex", ".etc2.ctex", ".astc.ctex", ".ctex" };
-	} else if (p_internal_path.ends_with(".bptc.ctex")) {
-		base_path = p_internal_path.trim_suffix(".bptc.ctex");
-		candidate_suffixes = { ".s3tc.ctex", ".etc2.ctex", ".astc.ctex", ".ctex" };
-	} else if (p_internal_path.ends_with(".etc2.ctex")) {
-		base_path = p_internal_path.trim_suffix(".etc2.ctex");
-		candidate_suffixes = { ".astc.ctex", ".s3tc.ctex", ".bptc.ctex", ".ctex" };
-	} else if (p_internal_path.ends_with(".astc.ctex")) {
-		base_path = p_internal_path.trim_suffix(".astc.ctex");
-		candidate_suffixes = { ".etc2.ctex", ".s3tc.ctex", ".bptc.ctex", ".ctex" };
-	} else {
-		return false;
-	}
-
-	for (const String &suffix : candidate_suffixes) {
-		const String candidate_path = base_path + suffix;
-		if (FileAccess::exists(candidate_path)) {
-			r_variant_path = candidate_path;
+	const String target_name = p_internal_path.get_file();
+	while (true) {
+		const String entry = dir->get_next();
+		if (entry.is_empty()) {
+			break;
+		}
+		if (dir->current_is_dir()) {
+			continue;
+		}
+		if (entry.nocasecmp_to(target_name) == 0) {
+			r_variant_path = p_internal_path.get_base_dir().path_join(entry);
+			dir->list_dir_end();
 			return true;
 		}
 	}
 
+	dir->list_dir_end();
 	return false;
 }
 
@@ -180,6 +220,46 @@ static bool _is_missing_project_imported_path(const String &p_path) {
 	}
 	const String imported_dir_path = ProjectSettings::get_singleton()->get_project_data_path().path_join("imported");
 	return p_path.begins_with(imported_dir_path + "/") && !FileAccess::exists(p_path);
+}
+
+static bool _is_missing_project_imported_shared_path(const String &p_path) {
+	if (!ProjectSettings::get_singleton()) {
+		return false;
+	}
+	const String imported_shared_dir_path = ProjectSettings::get_singleton()->get_project_data_path().path_join("imported/shared");
+	return p_path.begins_with(imported_shared_dir_path + "/") && !FileAccess::exists(p_path);
+}
+
+static String _extract_lazy_missing_internal_dependency_path(const String &p_dependency) {
+	PackedStringArray dependency_parts = p_dependency.split("::");
+	for (int i = dependency_parts.size() - 1; i >= 0; i--) {
+		if (dependency_parts[i].contains("://")) {
+			return dependency_parts[i];
+		}
+	}
+	return p_dependency;
+}
+
+static String _get_lazy_missing_internal_artifact_kind(const String &p_path) {
+	const String base_name = p_path.get_file().get_basename();
+	const int hash_separator = base_name.find_char('-');
+	if (hash_separator == -1) {
+		return base_name;
+	}
+	return base_name.substr(0, hash_separator);
+}
+
+static int _get_lazy_missing_internal_basename_match_score(const String &p_a, const String &p_b) {
+	const String a = p_a.get_file().get_basename().to_lower();
+	const String b = p_b.get_file().get_basename().to_lower();
+	const int limit = MIN(a.length(), b.length());
+
+	int prefix_len = 0;
+	while (prefix_len < limit && a[prefix_len] == b[prefix_len]) {
+		prefix_len++;
+	}
+
+	return prefix_len;
 }
 
 static bool _import_file_references_internal_path(const String &p_import_file_path, const String &p_internal_path, String &r_source_file) {
@@ -433,7 +513,155 @@ static bool _find_source_for_internal_resource_recursive(const String &p_dir_pat
 	return found_match;
 }
 
-static bool _try_lazy_reimport_missing_internal_resource(const String &p_internal_path) {
+static bool _find_cached_lazy_missing_internal_replacement_path(const String &p_internal_path, String &r_replacement_path) {
+	MutexLock lock(lazy_missing_internal_replacement_cache_mutex);
+	const String *replacement_path = lazy_missing_internal_replacement_cache.getptr(p_internal_path);
+	if (replacement_path == nullptr) {
+		return false;
+	}
+	if (!FileAccess::exists(*replacement_path)) {
+		lazy_missing_internal_replacement_cache.erase(p_internal_path);
+		return false;
+	}
+	r_replacement_path = *replacement_path;
+	return true;
+}
+
+static bool _find_replacement_internal_path_from_source(const String &p_internal_path, const String &p_source_file, const String &p_type_hint, String &r_replacement_path) {
+	const String import_file_path = p_source_file + ".import";
+	Vector<String> internal_paths;
+	String source_file;
+	if (!_read_import_file_internal_paths(import_file_path, internal_paths, source_file)) {
+		return false;
+	}
+
+	const String missing_base_dir = p_internal_path.get_base_dir();
+	const String missing_extension = p_internal_path.get_extension().to_lower();
+	const String missing_artifact_kind = _get_lazy_missing_internal_artifact_kind(p_internal_path);
+
+	for (const String &internal_path : internal_paths) {
+		if (!FileAccess::exists(internal_path)) {
+			continue;
+		}
+
+		List<String> dependencies;
+		ResourceLoader::get_dependencies(internal_path, &dependencies, false);
+		for (const String &dependency : dependencies) {
+			const String dependency_path = _extract_lazy_missing_internal_dependency_path(dependency);
+			if (!dependency_path.begins_with(missing_base_dir + "/")) {
+				continue;
+			}
+			if (!FileAccess::exists(dependency_path)) {
+				continue;
+			}
+			if (dependency_path.get_extension().to_lower() != missing_extension) {
+				continue;
+			}
+			if (_get_lazy_missing_internal_artifact_kind(dependency_path) != missing_artifact_kind) {
+				continue;
+			}
+			if (!p_type_hint.is_empty()) {
+				const String dependency_type = ResourceLoader::get_resource_type(dependency_path);
+				if (!dependency_type.is_empty() && dependency_type != p_type_hint) {
+					continue;
+				}
+			}
+
+			r_replacement_path = dependency_path;
+			{
+				MutexLock lock(lazy_missing_internal_replacement_cache_mutex);
+				lazy_missing_internal_replacement_cache.insert(p_internal_path, r_replacement_path);
+			}
+			_log_lazy_internal_debug(vformat("[lazy-missing] using replacement internal path: missing=%s replacement=%s source=%s", p_internal_path, r_replacement_path, p_source_file));
+			return true;
+		}
+	}
+
+	return false;
+}
+
+static void _heal_lazy_missing_internal_referrer_dependency(const String &p_referrer_path, const String &p_missing_internal_path, const String &p_replacement_path) {
+	if (p_referrer_path.is_empty() || p_replacement_path.is_empty() || p_referrer_path == p_replacement_path) {
+		return;
+	}
+	if (!FileAccess::exists(p_referrer_path)) {
+		return;
+	}
+
+	const String project_data_path = ProjectSettings::get_singleton()->get_project_data_path();
+	if (p_referrer_path == project_data_path || p_referrer_path.begins_with(project_data_path + "/")) {
+		return;
+	}
+
+	HashMap<String, String> dependency_renames;
+	dependency_renames.insert(p_missing_internal_path, p_replacement_path);
+	const Error rename_err = ResourceLoader::rename_dependencies(p_referrer_path, dependency_renames);
+	if (rename_err == OK) {
+		_log_lazy_internal_debug(vformat("[lazy-missing] healed referrer dependency: referrer=%s old=%s new=%s", p_referrer_path, p_missing_internal_path, p_replacement_path));
+	} else {
+		_log_lazy_internal_debug(vformat("[lazy-missing] failed to heal referrer dependency (%d): referrer=%s old=%s new=%s", int(rename_err), p_referrer_path, p_missing_internal_path, p_replacement_path));
+	}
+}
+
+static bool _find_scene_import_source_near_referrer(const String &p_referrer_path, String &r_source_file) {
+	r_source_file = String();
+
+	if (p_referrer_path.is_empty()) {
+		return false;
+	}
+
+	Ref<DirAccess> dir = DirAccess::open(p_referrer_path.get_base_dir());
+	if (dir.is_null() || dir->list_dir_begin() != OK) {
+		return false;
+	}
+
+	int best_score = -1;
+	String best_source_file;
+
+	while (true) {
+		const String entry = dir->get_next();
+		if (entry.is_empty()) {
+			break;
+		}
+		if (entry == "." || entry == ".." || dir->current_is_dir() || !entry.ends_with(".import")) {
+			continue;
+		}
+
+		const String import_file_path = p_referrer_path.get_base_dir().path_join(entry);
+		Vector<String> internal_paths;
+		String source_file;
+		if (!_read_import_file_internal_paths(import_file_path, internal_paths, source_file)) {
+			continue;
+		}
+
+		Ref<ResourceImporter> importer = ResourceFormatImporter::get_singleton()->get_importer_by_file(source_file);
+		if (importer.is_null() || importer->get_resource_type() != "PackedScene") {
+			continue;
+		}
+
+		const int score = _get_lazy_missing_internal_basename_match_score(p_referrer_path, source_file);
+		if (score > best_score) {
+			best_score = score;
+			best_source_file = source_file;
+		}
+	}
+
+	dir->list_dir_end();
+
+	if (best_source_file.is_empty()) {
+		return false;
+	}
+
+	r_source_file = best_source_file;
+	_log_lazy_internal_debug(vformat("[lazy-missing] using nearby scene import source: referrer=%s source=%s", p_referrer_path, r_source_file));
+	return true;
+}
+
+static bool _try_lazy_reimport_missing_internal_resource(const String &p_internal_path, const String &p_referrer_path, const String &p_type_hint, String *r_retry_path) {
+	if (r_retry_path != nullptr) {
+		*r_retry_path = p_internal_path;
+	}
+
 	if (!Engine::get_singleton()->is_editor_hint()) {
 		_log_lazy_internal_debug(vformat("[lazy-missing] skip (not editor hint): %s", p_internal_path));
 		return false;
@@ -467,6 +695,11 @@ static bool _try_lazy_reimport_missing_internal_resource(const String &p_interna
 	}
 
 	if (source_file.is_empty() && _find_source_for_internal_resource_recursive("res://", p_internal_path, source_file)) {
+		MutexLock lock(lazy_missing_internal_source_cache_mutex);
+		lazy_missing_internal_source_cache.insert(p_internal_path, source_file);
+	}
+
+	if (source_file.is_empty() && _is_missing_project_imported_shared_path(p_internal_path) && _find_scene_import_source_near_referrer(p_referrer_path, source_file)) {
 		MutexLock lock(lazy_missing_internal_source_cache_mutex);
 		lazy_missing_internal_source_cache.insert(p_internal_path, source_file);
 	}
@@ -526,7 +759,25 @@ static bool _try_lazy_reimport_missing_internal_resource(const String &p_interna
 	} else {
 		_log_lazy_internal_debug(vformat("[lazy-missing] reimport succeeded: source=%s internal=%s", source_file, p_internal_path));
 	}
-	return import_err == OK;
+	if (import_err != OK) {
+		return false;
+	}
+
+	if (FileAccess::exists(p_internal_path)) {
+		return true;
+	}
+
+	String replacement_path;
+	if (_is_missing_project_imported_shared_path(p_internal_path) && _find_replacement_internal_path_from_source(p_internal_path, source_file, p_type_hint, replacement_path)) {
+		_heal_lazy_missing_internal_referrer_dependency(p_referrer_path, p_internal_path, replacement_path);
+		if (r_retry_path != nullptr) {
+			*r_retry_path = replacement_path;
+		}
+		return true;
+	}
+
+	_log_lazy_internal_debug(vformat("[lazy-missing] reimport finished but requested internal path is still missing: %s", p_internal_path));
+	return false;
 }
 
 } // namespace
@@ -748,6 +999,7 @@ ResourceLoader::LoadToken::~LoadToken() {
 Ref<Resource> ResourceLoader::_load(const String &p_path, const String &p_original_path, const String &p_type_hint, CacheMode p_cache_mode, Error *r_error, bool p_use_sub_threads, float *r_progress) {
 	const String &original_path = p_original_path.is_empty() ? p_path : p_original_path;
 	load_nesting++;
+	LazyMissingInternalLoadScope lazy_missing_internal_load_scope(p_path);
 
 	print_verbose(vformat("Loading resource: %s remapped: %s", p_path, _path_remap(p_path)));
 
@@ -761,11 +1013,20 @@ Ref<Resource> ResourceLoader::_load(const String &p_path, const String &p_origin
 			return _load(existing_variant_path, p_original_path, p_type_hint, p_cache_mode, r_error, p_use_sub_threads, r_progress);
 		}
 
-		if (_try_lazy_reimport_missing_internal_resource(p_path)) {
-			_log_lazy_internal_debug(vformat("[lazy-missing] retrying original path after reimport: %s", p_path));
+		String replacement_path;
+		if (_find_cached_lazy_missing_internal_replacement_path(p_path, replacement_path)) {
+			_log_lazy_internal_debug(vformat("[lazy-missing] trying cached replacement path: missing=%s replacement=%s", p_path, replacement_path));
 			res_ref_overrides.erase(load_nesting);
 			load_nesting--;
-			return _load(p_path, p_original_path, p_type_hint, p_cache_mode, r_error, p_use_sub_threads, r_progress);
+			return _load(replacement_path, p_original_path, p_type_hint, p_cache_mode, r_error, p_use_sub_threads, r_progress);
+		}
+
+		String retry_path = p_path;
+		if (_try_lazy_reimport_missing_internal_resource(p_path, lazy_missing_internal_load_scope.get_referrer_path(), p_type_hint, &retry_path)) {
+			_log_lazy_internal_debug(vformat("[lazy-missing] retrying path after reimport: missing=%s retry=%s", p_path, retry_path));
+			res_ref_overrides.erase(load_nesting);
+			load_nesting--;
+			return _load(retry_path, p_original_path, p_type_hint, p_cache_mode, r_error, p_use_sub_threads, r_progress);
 		}
 
 		if (r_error) {

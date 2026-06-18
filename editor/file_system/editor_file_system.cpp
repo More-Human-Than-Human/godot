@@ -722,6 +722,12 @@ bool EditorFileSystem::_is_test_for_reimport_needed(const String &p_path, uint64
 	return false;
 }
 
+static void _refresh_import_scan_settings(bool &r_reimport_on_missing_imported_files, bool &r_lazy_reimport_on_scan, bool &r_lazy_reimport_on_load) {
+	r_reimport_on_missing_imported_files = GLOBAL_GET("editor/import/reimport_missing_imported_files");
+	r_lazy_reimport_on_scan = GLOBAL_GET("editor/import/lazy_reimport_on_scan");
+	r_lazy_reimport_on_load = GLOBAL_GET("editor/import/lazy_reimport_on_load");
+}
+
 bool EditorFileSystem::_test_for_reimport(const String &p_path, const String &p_expected_import_md5) {
 	const bool has_cached_import_md5 = !p_expected_import_md5.is_empty();
 	if (has_cached_import_md5) {
@@ -1012,6 +1018,7 @@ bool EditorFileSystem::_scan_import_support(const Vector<String> &reimports) {
 }
 
 bool EditorFileSystem::_update_scan_actions() {
+	_refresh_import_scan_settings(reimport_on_missing_imported_files, lazy_reimport_on_scan, lazy_reimport_on_load);
 	sources_changed.clear();
 
 	// We need to update the script global class names before the reimports to be sure that
@@ -1256,6 +1263,8 @@ void EditorFileSystem::scan() {
 	if (scanning || scanning_changes || thread.is_started()) {
 		return;
 	}
+
+	_refresh_import_scan_settings(reimport_on_missing_imported_files, lazy_reimport_on_scan, lazy_reimport_on_load);
 
 	// The first scan must be on the main thread because, after the first scan and update
 	// of global class names, we load the plugins and autoloads. These need to
